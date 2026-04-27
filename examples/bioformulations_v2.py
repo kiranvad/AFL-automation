@@ -1,15 +1,21 @@
 from AFL.automation.prepare.OT2Prepare import OT2Prepare
 from AFL.automation.APIServer.APIServer import APIServer
 from AFL.automation.APIServer.Client import Client
+from AFL.automation.APIServer.data.DataTiled import DataTiled
 
 import numpy as np
 import time 
 
 # Create the driver instance
 driver = OT2Prepare()
+data = DataTiled(
+    server="http://127.0.0.1:8000",
+    api_key="devkey",
+    backup_path="./tiled-backup",
+)
 
 # Create the server
-server = APIServer('OT2PrepareServer')
+server = APIServer('OT2PrepareServer', data=data)
 
 # Add your driver to the queue and run
 server.add_standard_routes()
