@@ -7,7 +7,12 @@ import numpy as np
 import time 
 
 # Create the driver instance
-driver = OT2Prepare()
+driver = OT2Prepare(
+    overrides={
+        "robot_ip": "192.168.1.50",
+        "robot_port": "31950",
+    }
+)
 data = DataTiled(
     server="http://127.0.0.1:8000",
     api_key="devkey",
