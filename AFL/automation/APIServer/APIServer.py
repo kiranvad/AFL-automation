@@ -13,7 +13,9 @@ from flask_jwt_extended import (
 
 
 
+import contextlib
 import datetime,requests,subprocess,shlex,os,time
+import io
 import threading,queue,logging,json,pathlib,uuid
 
 try:
@@ -166,14 +168,17 @@ class APIServer:
         self.zeroconf.register_service(self.zeroconf_info)
         self.app.logger.info("Started mDNS service advertisement.")
 
-    def run(self, use_waitress=None, **kwargs):
+    def run(self, use_waitress=None, quiet=False, **kwargs):
         if self.queue_daemon is None:
             raise ValueError('create_queue must be called before running server')
+        if quiet:
+            self.app.logger.disabled = True
         if _ADVERTISE_ZEROCONF:
             try:
                 self.advertise_zeroconf(**kwargs)
             except Exception as e:
-                self.app.logger.warning(f'failed while trying to start zeroconf {e}, continuing')
+                if not quiet:
+                    self.app.logger.warning(f'failed while trying to start zeroconf {e}, continuing')
         # before_first_request was removed in Flask >=3.0, so run init here
         # to start the queue daemon before the server begins serving.
         self.init()
@@ -185,22 +190,30 @@ class APIServer:
                 if not _HAVE_WAITRESS:
                     raise RuntimeError("waitress is not installed")
                 kwargs.setdefault('threads', 1)
-                wsgi_serve(self.app, **kwargs)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) if quiet else contextlib.nullcontext():
+                    wsgi_serve(self.app, **kwargs)
             else:
                 kwargs.setdefault('use_debugger', False)
                 kwargs.setdefault('debug', False)
                 kwargs.setdefault('use_reloader', False)
-                self.app.run(**kwargs)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) if quiet else contextlib.nullcontext():
+                    self.app.run(**kwargs)
         finally:
             if _ADVERTISE_ZEROCONF:
                 self.zeroconf.unregister_service(self.zeroconf_info)
                 self.zeroconf.close()
 
-    def run_threaded(self, start_thread=True, use_waitress=None, **kwargs):
+    def run_threaded(self, start_thread=True, use_waitress=None, quiet=False, **kwargs):
         if self.queue_daemon is None:
             raise ValueError('create_queue must be called before running server')
+        if quiet:
+            self.app.logger.disabled = True
         if _ADVERTISE_ZEROCONF:
-            self.advertise_zeroconf(**kwargs)
+            try:
+                self.advertise_zeroconf(**kwargs)
+            except Exception as e:
+                if not quiet:
+                    self.app.logger.warning(f'failed while trying to start zeroconf {e}, continuing')
 
         if use_waitress is None:
             use_waitress = _HAVE_WAITRESS
@@ -209,23 +222,32 @@ class APIServer:
             if not _HAVE_WAITRESS:
                 raise RuntimeError("waitress is not installed")
             kwargs.setdefault('threads', 1)
-            target = functools.partial(wsgi_serve,self.app)
+            target = functools.partial(wsgi_serve, self.app)
         else:
             kwargs.setdefault('use_debugger', False)
             kwargs.setdefault('debug', False)
             kwargs.setdefault('use_reloader', False)
             target = self.app.run
 
+        if quiet:
+            wrapped_target = functools.partial(self._run_quietly, target)
+        else:
+            wrapped_target = target
+
         # before_first_request was removed in Flask >=3.0, so run init here
         # to start the queue daemon before the server begins serving.
         self.init()
 
-        thread = threading.Thread(target=target,daemon=True,kwargs=kwargs)
-        
+        thread = threading.Thread(target=wrapped_target, daemon=True, kwargs=kwargs)
+
         if start_thread:
             thread.start()
         else:
             return thread
+
+    def _run_quietly(self, target, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            target(**kwargs)
 
     def add_standard_routes(self):
         self.app.add_url_rule('/','index_new',self.index_new)

@@ -38,6 +38,18 @@ class PreparedSample:
 
 
 @dataclass
+class TemperatureProcessingRecord:
+    sample_id: str
+    temperature_c: float
+    measurement_interval_s: float
+    step_index: int
+    total_steps: int
+    temperature_module_slot: str
+    destination: str
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
 class TransferRecord:
     sample_id: str
     from_location: str
@@ -52,6 +64,10 @@ class TurbidityMeasurement:
     sample_id: str
     component_concentrations_mg_ml: Dict[str, float]
     concentration_mg_ml: float
+    temperature_c: float
+    measurement_interval_s: float
+    step_index: int
+    total_steps: int
     label: str
     score: float
     image_metadata: Dict[str, object]
@@ -63,6 +79,8 @@ class ExperimentRecord:
     sample_id: str
     component_concentrations_mg_ml: Dict[str, float]
     concentration_mg_ml: float
+    temperature_c: float
+    measurement_interval_s: float
     label: str
     score: float
 
@@ -71,6 +89,9 @@ DEFAULT_COMPONENT_BOUNDS: Dict[str, List[float]] = {
     "BSA": [0.0, 200.0],
     "YCl3": [0.0, 10.0],
 }
+DEFAULT_TEMPERATURE_RANGE_C = [4.0, 60.0]
+DEFAULT_TEMPERATURE_COUNT = 4
+DEFAULT_MEASUREMENT_INTERVAL_S = 30.0
 
 DEFAULT_STOCKS: List[Dict[str, object]] = [
     {
@@ -124,6 +145,10 @@ def measurement_to_dataset_payload(measurement: TurbidityMeasurement) -> Dict[st
         "sample_id": measurement.sample_id,
         "component_concentrations_mg_ml": dict(measurement.component_concentrations_mg_ml),
         "concentration_mg_ml": measurement.concentration_mg_ml,
+        "temperature_c": measurement.temperature_c,
+        "measurement_interval_s": measurement.measurement_interval_s,
+        "step_index": measurement.step_index,
+        "total_steps": measurement.total_steps,
         "label": measurement.label,
         "score": measurement.score,
         "image_metadata": measurement.image_metadata,

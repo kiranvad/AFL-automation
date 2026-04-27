@@ -34,7 +34,7 @@ class TurbidityExampleDriver(Driver):
         }
 
     @Driver.queued()
-    def measure(self, transfer: Dict[str, object]):
+    def measure(self, transfer: Dict[str, object], temperature_step: Dict[str, object]):
         sample = transfer["metadata"]["sample"]
         component_concentrations = dict(sample.get("component_concentrations_mg_ml", {}))
         concentration = float(component_concentrations.get("BSA", sample.get("concentration_mg_ml", 0.0)))
@@ -44,14 +44,22 @@ class TurbidityExampleDriver(Driver):
             sample_id=str(sample["sample_id"]),
             component_concentrations_mg_ml=component_concentrations,
             concentration_mg_ml=concentration,
+            temperature_c=float(temperature_step["temperature_c"]),
+            measurement_interval_s=float(temperature_step["measurement_interval_s"]),
+            step_index=int(temperature_step["step_index"]),
+            total_steps=int(temperature_step["total_steps"]),
             label=label,
             score=score,
             image_metadata={
                 "station": self.config["station_name"],
-                "synthetic_image_id": f"img-{sample['sample_id']}",
+                "synthetic_image_id": f"img-{sample['sample_id']}-t{temperature_step['step_index']}",
                 "pixel_mean": round(0.5 + score, 6),
             },
-            metadata={"transfer": transfer},
+            metadata={
+                "transfer": transfer,
+                "temperature_step": dict(temperature_step),
+                "waited_for_temperature": True,
+            },
         )
         measurement_dict = asdict(measurement)
         store_measurement(self.data, measurement_dict)

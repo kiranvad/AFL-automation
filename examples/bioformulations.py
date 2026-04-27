@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional
 
 import xarray as xr
@@ -7,7 +8,14 @@ import xarray as xr
 from AFL.automation.APIServer.Client import Client
 
 from agent import build_server as build_agent_server
-from common import DEFAULT_COMPONENT_BOUNDS, DEFAULT_STOCKS, DEFAULT_TARGETS, DEFAULT_TOTAL_VOLUME_UL
+from common import (
+    DEFAULT_COMPONENT_BOUNDS,
+    DEFAULT_MEASUREMENT_INTERVAL_S,
+    DEFAULT_STOCKS,
+    DEFAULT_TARGETS,
+    DEFAULT_TEMPERATURE_RANGE_C,
+    DEFAULT_TOTAL_VOLUME_UL,
+)
 from example_logging import (
     get_logger,
     log_agent_suggestion,
@@ -16,9 +24,10 @@ from example_logging import (
     log_prepare_request,
     log_server_initialized,
     log_setup,
+    log_temperature_plan,
+    log_temperature_setpoint,
     log_transfer,
     silence_framework_logging,
-    suppress_startup_output,
 )
 from opentrons import build_server as build_opentrons_server
 from tiled_data import ExampleTiledConfig, build_data_backend, records_for_sample
@@ -33,11 +42,50 @@ DEFAULT_PORTS = {
     "agent": 5054,
 }
 
+DEFAULT_TILED_SERVER = "http://127.0.0.1:8000"
+DEFAULT_TILED_API_KEY = "devkey"
+DEFAULT_OT2_ROBOT_PORT = "31950"
 
-def _prediction_to_composition(prediction: xr.Dataset) -> Dict[str, float]:
+
+def local_tiled_config(
+    uri: Optional[str] = None,
+    api_key: Optional[str] = None,
+    use_fallback: bool = False,
+) -> ExampleTiledConfig:
+    return ExampleTiledConfig(
+        uri=uri or os.environ.get("BIOFORMULATIONS_TILED_URI", DEFAULT_TILED_SERVER),
+        api_key=api_key or os.environ.get("BIOFORMULATIONS_TILED_API_KEY", DEFAULT_TILED_API_KEY),
+        use_fallback=use_fallback,
+    )
+
+
+def local_prep_config() -> Dict[str, object]:
+    robot_ip = os.environ.get("BIOFORMULATIONS_OT2_IP")
+    base_url = os.environ.get("BIOFORMULATIONS_OT2_BASE_URL")
+    use_hardware = bool(base_url or robot_ip)
+    config: Dict[str, object] = {
+        "ot2_use_hardware": use_hardware,
+        "ot2_base_url": base_url,
+        "ot2_robot_ip": robot_ip,
+        "ot2_robot_port": os.environ.get("BIOFORMULATIONS_OT2_PORT", DEFAULT_OT2_ROBOT_PORT),
+        "temp_module_model": os.environ.get("BIOFORMULATIONS_OT2_TEMP_MODULE", "temperatureModuleV2"),
+        "ot2_wait_for_temperature": os.environ.get("BIOFORMULATIONS_OT2_WAIT_FOR_TEMP", "true").lower() not in {"0", "false", "no"},
+        "ot2_temperature_timeout": int(os.environ.get("BIOFORMULATIONS_OT2_TEMP_TIMEOUT", "120")),
+    }
+    return config
+
+
+def _prediction_to_request(prediction: xr.Dataset) -> Dict[str, object]:
     components = [str(component) for component in prediction.coords["component"].values.tolist()]
     values = prediction["next_samples"].values[0].tolist()
-    return {component: float(value) for component, value in zip(components, values)}
+    composition = {component: float(value) for component, value in zip(components, values)}
+    temperatures = [float(value) for value in prediction["temperature_series"].values[0].tolist()]
+    measurement_interval_s = float(prediction["measurement_interval_s"].values[0])
+    return {
+        "component_concentrations_mg_ml": composition,
+        "temperature_series": temperatures,
+        "measurement_interval_s": measurement_interval_s,
+    }
 
 
 def _unwrap_queue_result(meta: Dict[str, object], task_name: str):
@@ -46,34 +94,45 @@ def _unwrap_queue_result(meta: Dict[str, object], task_name: str):
         raise RuntimeError(f"{task_name} failed: {result}")
     return result
 
+
 def start_local_servers(
     host: str = "127.0.0.1",
     ports: Optional[Dict[str, int]] = None,
     tiled_config: Optional[ExampleTiledConfig] = None,
     tiled_data=None,
     component_bounds: Optional[Dict[str, List[float]]] = None,
+    temperature_bounds: Optional[List[float]] = None,
+    measurement_interval_s: float = DEFAULT_MEASUREMENT_INTERVAL_S,
+    prep_overrides: Optional[Dict[str, object]] = None,
     logger=None,
 ):
     ports = ports or DEFAULT_PORTS
-    servers = {}
     tiled_data = tiled_data or build_data_backend(tiled_config)
-    agent_overrides = {"component_bounds": dict(component_bounds or DEFAULT_COMPONENT_BOUNDS)}
-    prep_overrides = {"stocks": [dict(stock) for stock in DEFAULT_STOCKS]}
-    builders = {
-        "prep": lambda **kwargs: build_opentrons_server(data=tiled_data, overrides=prep_overrides, **kwargs),
-        "load": lambda **kwargs: build_xarm_server(data=tiled_data, **kwargs),
-        "instrument": lambda **kwargs: build_turbidity_server(data=tiled_data, **kwargs),
-        "agent": lambda **kwargs: build_agent_server(data=tiled_data, overrides=agent_overrides, **kwargs),
-    }
     silence_framework_logging()
-    with suppress_startup_output():
-        for name, builder in builders.items():
-            server, _, _ = builder(host=host, port=ports[name])
-            server.run_threaded(host=host, port=ports[name], debug=False, use_reloader=False, use_waitress=False)
-            servers[name] = server
-    if logger is not None:
-        for name, port in ports.items():
-            log_server_initialized(logger, name, host, port)
+    servers = {
+        "prep": build_opentrons_server(
+            host=host,
+            port=ports["prep"],
+            data=tiled_data,
+            overrides={"stocks": [dict(stock) for stock in DEFAULT_STOCKS], **dict(prep_overrides or {})},
+        )[0],
+        "load": build_xarm_server(host=host, port=ports["load"], data=tiled_data)[0],
+        "instrument": build_turbidity_server(host=host, port=ports["instrument"], data=tiled_data)[0],
+        "agent": build_agent_server(
+            host=host,
+            port=ports["agent"],
+            data=tiled_data,
+            overrides={
+                "component_bounds": dict(component_bounds or DEFAULT_COMPONENT_BOUNDS),
+                "temperature_bounds": list(temperature_bounds or DEFAULT_TEMPERATURE_RANGE_C),
+                "measurement_interval_s": float(measurement_interval_s),
+            },
+        )[0],
+    }
+    for name, server in servers.items():
+        server.run_threaded(host=host, port=ports[name], debug=False, use_reloader=False, use_waitress=False, quiet=True)
+        if logger is not None:
+            log_server_initialized(logger, name, host, ports[name])
     servers["tiled_data"] = tiled_data
     return servers
 
@@ -92,6 +151,10 @@ def measurement_to_dataset(measurement: Dict[str, object]) -> xr.Dataset:
     component_concentrations = dict(measurement.get("component_concentrations_mg_ml", {}))
     data_vars = {
         "concentration_mg_ml": xr.DataArray([float(measurement["concentration_mg_ml"])], dims=("sample",)),
+        "temperature_c": xr.DataArray([float(measurement["temperature_c"])], dims=("sample",)),
+        "measurement_interval_s": xr.DataArray([float(measurement["measurement_interval_s"])], dims=("sample",)),
+        "step_index": xr.DataArray([int(measurement["step_index"])], dims=("sample",)),
+        "total_steps": xr.DataArray([int(measurement["total_steps"])], dims=("sample",)),
         "score": xr.DataArray([float(measurement["score"])], dims=("sample",)),
         "label": xr.DataArray([str(measurement["label"])], dims=("sample",)),
     }
@@ -120,39 +183,63 @@ def run_protocol(
     host: str = "127.0.0.1",
     ports: Optional[Dict[str, int]] = None,
     tiled_config: Optional[ExampleTiledConfig] = None,
+    prep_overrides: Optional[Dict[str, object]] = None,
     component_bounds: Optional[Dict[str, List[float]]] = None,
+    temperature_bounds: Optional[List[float]] = None,
+    measurement_interval_s: float = DEFAULT_MEASUREMENT_INTERVAL_S,
 ):
     ports = ports or DEFAULT_PORTS
     component_bounds = dict(component_bounds or DEFAULT_COMPONENT_BOUNDS)
+    temperature_bounds = list(temperature_bounds or DEFAULT_TEMPERATURE_RANGE_C)
     logger = get_logger()
     start_local_servers(
         host=host,
         ports=ports,
         tiled_config=tiled_config,
         component_bounds=component_bounds,
+        temperature_bounds=temperature_bounds,
+        prep_overrides=prep_overrides,
+        measurement_interval_s=measurement_interval_s,
         logger=logger,
     )
     clients = make_clients(host=host, ports=ports)
-    log_setup(logger, DEFAULT_STOCKS, component_bounds)
+    log_setup(logger, DEFAULT_STOCKS, component_bounds, temperature_bounds, measurement_interval_s)
 
-    requested = [dict(target) for target in (initial_targets or DEFAULT_TARGETS)]
+    requested = [
+        {
+            "component_concentrations_mg_ml": dict(target),
+            "temperature_series": list(temperature_bounds),
+            "measurement_interval_s": float(measurement_interval_s),
+        }
+        for target in (initial_targets or DEFAULT_TARGETS)
+    ]
     history: List[Dict[str, object]] = []
-    seen_compositions = set()
+    seen_requests = set()
 
     while len(history) < budget:
         if requested:
-            composition = dict(requested.pop(0))
+            experiment_request = dict(requested.pop(0))
         else:
             prediction_meta = clients["agent"].enqueue(task_name="predict", sample_uuid=f"sample-{len(history)+1:03d}")
             prediction_uuid = _unwrap_queue_result(prediction_meta, "predict")
             prediction = clients["agent"].retrieve_obj(uid=prediction_uuid)
-            composition = _prediction_to_composition(prediction)
-            log_agent_suggestion(logger, composition)
+            experiment_request = _prediction_to_request(prediction)
+            log_agent_suggestion(
+                logger,
+                experiment_request["component_concentrations_mg_ml"],
+                experiment_request["temperature_series"],
+            )
 
-        composition_key = tuple(sorted((component, round(float(value), 6)) for component, value in composition.items()))
-        if composition_key in seen_compositions:
+        composition = dict(experiment_request["component_concentrations_mg_ml"])
+        temperatures = [float(value) for value in experiment_request["temperature_series"]]
+        interval_s = float(experiment_request.get("measurement_interval_s", measurement_interval_s))
+        request_key = (
+            tuple(sorted((component, round(float(value), 6)) for component, value in composition.items())),
+            tuple(round(value, 6) for value in temperatures),
+        )
+        if request_key in seen_requests:
             break
-        seen_compositions.add(composition_key)
+        seen_requests.add(request_key)
 
         log_prepare_request(logger, composition)
         prepare_meta = clients["prep"].enqueue(
@@ -161,41 +248,69 @@ def run_protocol(
         )
         prepare_result = _unwrap_queue_result(prepare_meta, "prepare")
         prepared_sample = prepare_result[0]
+        log_temperature_plan(logger, prepared_sample["sample_id"], temperatures, interval_s)
 
-        log_transfer(logger, prepared_sample["sample_id"], "turbidity_station")
         transfer_meta = clients["load"].enqueue(task_name="transfer", sample=prepared_sample)
         transfer = _unwrap_queue_result(transfer_meta, "transfer")
+        log_transfer(logger, prepared_sample["sample_id"], transfer["to_location"])
 
-        log_measurement_triggered(logger, prepared_sample["sample_id"])
-        measurement_meta = clients["instrument"].enqueue(task_name="measure", transfer=transfer)
-        measurement = _unwrap_queue_result(measurement_meta, "measure")
-        stored_measurement = measurement
-        log_measurement_result(logger, stored_measurement["sample_id"], stored_measurement["label"])
+        temperature_steps: List[Dict[str, object]] = []
+        measurements: List[Dict[str, object]] = []
+        total_steps = len(temperatures)
+        for step_index, temperature_c in enumerate(temperatures):
+            log_temperature_setpoint(logger, prepared_sample["sample_id"], temperature_c, step_index, total_steps)
+            temperature_meta = clients["prep"].enqueue(
+                task_name="process_temperature_step",
+                sample=prepared_sample,
+                temperature_c=temperature_c,
+                step_index=step_index,
+                total_steps=total_steps,
+                measurement_interval_s=interval_s,
+            )
+            temperature_step = _unwrap_queue_result(temperature_meta, "process_temperature_step")
+            temperature_steps.append(temperature_step)
 
-        dataset = measurement_to_dataset(stored_measurement)
-        db_uuid = clients["agent"].deposit_obj(dataset)
-        append_meta = clients["agent"].enqueue(task_name="append", db_uuid=db_uuid, concat_dim="sample")
-        _unwrap_queue_result(append_meta, "append")
+            log_measurement_triggered(logger, prepared_sample["sample_id"], temperature_c, interval_s)
+            measurement_meta = clients["instrument"].enqueue(
+                task_name="measure",
+                transfer=transfer,
+                temperature_step=temperature_step,
+            )
+            measurement = _unwrap_queue_result(measurement_meta, "measure")
+            measurements.append(measurement)
+            log_measurement_result(logger, measurement["sample_id"], measurement["label"], measurement["temperature_c"])
 
-        next_meta = clients["agent"].enqueue(task_name="predict", sample_uuid=measurement["sample_id"])
+            dataset = measurement_to_dataset(measurement)
+            db_uuid = clients["agent"].deposit_obj(dataset)
+            append_meta = clients["agent"].enqueue(task_name="append", db_uuid=db_uuid, concat_dim="sample")
+            _unwrap_queue_result(append_meta, "append")
+
+        next_meta = clients["agent"].enqueue(task_name="predict", sample_uuid=prepared_sample["sample_id"])
         next_uuid = _unwrap_queue_result(next_meta, "predict")
         next_prediction = clients["agent"].retrieve_obj(uid=next_uuid)
-        next_composition = _prediction_to_composition(next_prediction)
-        log_agent_suggestion(logger, next_composition)
+        next_request = _prediction_to_request(next_prediction)
+        log_agent_suggestion(
+            logger,
+            next_request["component_concentrations_mg_ml"],
+            next_request["temperature_series"],
+        )
 
         history.append(
             {
                 "requested_component_concentrations_mg_ml": composition,
+                "requested_temperature_series": temperatures,
+                "measurement_interval_s": interval_s,
                 "prepared_sample": prepared_sample,
                 "transfer": transfer,
-                "measurement": stored_measurement,
-                "next_component_concentrations_mg_ml": next_composition,
+                "temperature_steps": temperature_steps,
+                "measurements": measurements,
+                "next_request": next_request,
             }
         )
-        requested.append(next_composition)
+        requested.append(next_request)
 
     return history
 
 
 if __name__ == "__main__":
-    run_protocol()
+    run_protocol(tiled_config=local_tiled_config(), prep_overrides=local_prep_config())

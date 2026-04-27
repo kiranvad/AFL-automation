@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import asdict, is_dataclass
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import numpy as np
 
@@ -12,6 +19,76 @@ from AFL.automation.APIServer.data.DataTiled import DataTiled
 DEFAULT_TILED_URI = "file://localhost"
 DEFAULT_TILED_API_KEY = ""
 DEFAULT_TILED_BACKUP_DIR = Path(__file__).resolve().parent / ".tiled-backup"
+DEFAULT_TILED_CONFIG_PATH = Path(__file__).resolve().parent.parent / "tiled" / "config.yml"
+
+_TILED_PROCESS: Optional[subprocess.Popen] = None
+
+
+def _is_tiled_reachable(uri: str, timeout: float = 1.0) -> bool:
+    parsed = urlparse(uri)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        request = Request(uri.rstrip("/") + "/api/v1", method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def _wait_for_tiled(uri: str, timeout_s: float = 15.0, interval_s: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _is_tiled_reachable(uri):
+            return True
+        time.sleep(interval_s)
+    return False
+
+
+def _stop_tiled_server() -> None:
+    global _TILED_PROCESS
+    if _TILED_PROCESS is None or _TILED_PROCESS.poll() is not None:
+        _TILED_PROCESS = None
+        return
+    _TILED_PROCESS.terminate()
+    try:
+        _TILED_PROCESS.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _TILED_PROCESS.kill()
+        _TILED_PROCESS.wait(timeout=5)
+    _TILED_PROCESS = None
+
+
+def _start_tiled_server(
+    uri: str,
+    config_path: Path = DEFAULT_TILED_CONFIG_PATH,
+    api_key: str = DEFAULT_TILED_API_KEY,
+) -> subprocess.Popen:
+    global _TILED_PROCESS
+
+    if _TILED_PROCESS is not None and _TILED_PROCESS.poll() is None:
+        return _TILED_PROCESS
+
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tiled", "serve", "config", str(config_path), "--api-key", api_key],
+        cwd=str(config_path.parent.parent),
+        env=os.environ.copy(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if not _wait_for_tiled(uri):
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        raise RuntimeError(f"Started Tiled process but {uri} did not become ready")
+
+    _TILED_PROCESS = process
+    atexit.register(_stop_tiled_server)
+    return process
 
 
 class LocalTiledClient:
@@ -68,18 +145,28 @@ class ExampleTiledConfig:
         api_key: str = DEFAULT_TILED_API_KEY,
         backup_path: Optional[Path] = None,
         use_fallback: bool = True,
+        autostart_if_missing: bool = False,
+        tiled_config_path: Optional[Path] = None,
     ):
         self.uri = uri
         self.api_key = api_key
         self.backup_path = Path(backup_path or DEFAULT_TILED_BACKUP_DIR)
         self.use_fallback = use_fallback
+        self.autostart_if_missing = autostart_if_missing
+        self.tiled_config_path = Path(tiled_config_path or DEFAULT_TILED_CONFIG_PATH)
 
 
 def build_data_backend(config: Optional[ExampleTiledConfig] = None):
     config = config or ExampleTiledConfig()
     config.backup_path.mkdir(parents=True, exist_ok=True)
     if config.uri:
-        return DataTiled(config.uri, api_key=config.api_key, backup_path=str(config.backup_path))
+        if _is_tiled_reachable(config.uri):
+            return DataTiled(config.uri, api_key=config.api_key, backup_path=str(config.backup_path))
+        if config.autostart_if_missing:
+            _start_tiled_server(config.uri, config_path=config.tiled_config_path, api_key=config.api_key)
+            return DataTiled(config.uri, api_key=config.api_key, backup_path=str(config.backup_path))
+        if not config.use_fallback:
+            return DataTiled(config.uri, api_key=config.api_key, backup_path=str(config.backup_path))
     if config.use_fallback:
         return ExampleDataTiled(backup_path=config.backup_path)
     return None
@@ -113,10 +200,24 @@ def store_preparation(data, prepared_sample: object):
     record = _as_record(prepared_sample)
     component_names = list(record.get("component_concentrations_mg_ml", {}).keys())
     array_values = [float(record["component_concentrations_mg_ml"][name]) for name in component_names]
-    array_values.append(float(record["total_volume_ul"]))
+    array_values.extend([float(record["total_volume_ul"]), float(record.get("temperature_c", 0.0))])
     record["components"] = component_names
     array = np.asarray([array_values], dtype=float)
     return _write_stage_record(data, record["sample_id"], "opentrons_prepare", "prepared_sample", record, array=array)
+
+
+def store_temperature_processing(data, temperature_record: object):
+    record = _as_record(temperature_record)
+    array = np.asarray(
+        [[
+            float(record["temperature_c"]),
+            float(record["measurement_interval_s"]),
+            float(record["step_index"]),
+            float(record["total_steps"]),
+        ]],
+        dtype=float,
+    )
+    return _write_stage_record(data, record["sample_id"], "opentrons_temperature", "temperature_step", record, array=array)
 
 
 def store_transfer(data, transfer: object):
@@ -137,6 +238,10 @@ def build_measurement_metadata(measurement: Dict[str, object]) -> Dict[str, obje
         "label": str(measurement["label"]),
         "score": float(measurement["score"]),
         "concentration_mg_ml": float(measurement["concentration_mg_ml"]),
+        "temperature_c": float(measurement["temperature_c"]),
+        "measurement_interval_s": float(measurement["measurement_interval_s"]),
+        "step_index": int(measurement["step_index"]),
+        "total_steps": int(measurement["total_steps"]),
         "image_metadata": image_metadata,
         "measurement_metadata": nested_metadata,
     }
@@ -145,7 +250,12 @@ def build_measurement_metadata(measurement: Dict[str, object]) -> Dict[str, obje
 def store_measurement(data, measurement: Dict[str, object]):
     metadata = build_measurement_metadata(measurement)
     image_array = np.asarray(
-        [[float(measurement["concentration_mg_ml"]), float(measurement["score"])]],
+        [[
+            float(measurement["concentration_mg_ml"]),
+            float(measurement["score"]),
+            float(measurement["temperature_c"]),
+            float(measurement["measurement_interval_s"]),
+        ]],
         dtype=float,
     )
     if data is None:
@@ -163,7 +273,14 @@ def store_measurement(data, measurement: Dict[str, object]):
 
 def store_agent_append(data, dataset, record: Dict[str, object]):
     sample_id = str(dataset.attrs.get("sample_uuid", dataset.coords["sample"].values[0]))
-    array = np.asarray([[float(record["concentration_mg_ml"]), float(record["score"])]], dtype=float)
+    array = np.asarray(
+        [[
+            float(record["concentration_mg_ml"]),
+            float(record["score"]),
+            float(record.get("temperature_c", 0.0)),
+        ]],
+        dtype=float,
+    )
     payload = {
         "sample_id": sample_id,
         "record": dict(record),
@@ -172,14 +289,26 @@ def store_agent_append(data, dataset, record: Dict[str, object]):
     return _write_stage_record(data, sample_id, "agent_append", "agent_observation", payload, array=array)
 
 
-def store_agent_prediction(data, sample_id: str, composition: Dict[str, float], campaign_name: Optional[str] = None):
+def store_agent_prediction(
+    data,
+    sample_id: str,
+    composition: Dict[str, float],
+    temperature_series: List[float],
+    measurement_interval_s: float,
+    campaign_name: Optional[str] = None,
+):
     payload = {
         "sample_id": str(sample_id),
         "next_composition": dict(composition),
+        "temperature_series": [float(value) for value in temperature_series],
+        "measurement_interval_s": float(measurement_interval_s),
         "AL_campaign_name": campaign_name,
     }
     component_names = list(composition.keys())
-    array = np.asarray([[float(composition[name]) for name in component_names]], dtype=float)
+    array = np.asarray(
+        [[float(composition[name]) for name in component_names] + [float(value) for value in temperature_series]],
+        dtype=float,
+    )
     payload["components"] = component_names
     return _write_stage_record(data, sample_id, "agent_predict", "agent_prediction", payload, array=array)
 
@@ -187,9 +316,13 @@ def store_agent_prediction(data, sample_id: str, composition: Dict[str, float], 
 def measurement_from_tiled_entry(entry: Dict[str, object]) -> Dict[str, object]:
     metadata = dict(entry["metadata"])
     return {
-        "samponent_concentrations_mg_ml": dict(metadata.get("component_concentrations_mg_ml", {})),
-        "comple_id": metadata["sample_uuid"],
+        "component_concentrations_mg_ml": dict(metadata.get("component_concentrations_mg_ml", {})),
+        "sample_id": metadata["sample_uuid"],
         "concentration_mg_ml": metadata["concentration_mg_ml"],
+        "temperature_c": metadata.get("temperature_c"),
+        "measurement_interval_s": metadata.get("measurement_interval_s"),
+        "step_index": metadata.get("step_index"),
+        "total_steps": metadata.get("total_steps"),
         "label": metadata["label"],
         "score": metadata["score"],
         "image_metadata": metadata.get("image_metadata", {}),
