@@ -26,11 +26,11 @@
     "dimensions": {
         "xDimension": 127.5,
         "yDimension": 85,
-        "zDimension": 42.5
+        "zDimension": 62
     },
     "wells": {
         "A1": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
@@ -39,7 +39,7 @@
             "z": 0
         },
         "B1": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
@@ -48,7 +48,7 @@
             "z": 0
         },
         "A2": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
@@ -57,7 +57,7 @@
             "z": 0
         },
         "B2": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
@@ -66,7 +66,7 @@
             "z": 0
         },
         "A3": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
@@ -75,7 +75,7 @@
             "z": 0
         },
         "B3": {
-            "depth": 42.5,
+            "depth": 62,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
