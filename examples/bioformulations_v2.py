@@ -5,6 +5,7 @@ from AFL.automation.APIServer.data.DataTiled import DataTiled
 
 import numpy as np
 import time 
+import json
 
 # Create the driver instance
 driver = OT2Prepare(
@@ -13,6 +14,19 @@ driver = OT2Prepare(
         "robot_port": "31950",
     }
 )
+# Load standard labware (e.g., a 96-well plate)
+driver.load_labware(name='corning_96_wellplate_360ul_flat', slot='1')
+# Load custom labware from JSON
+with open('./custom_labware/ice_slurry_holder.json', 'r') as f:
+    custom_labware_def = json.load(f)
+driver.load_labware(
+    name=custom_labware_def['name'],
+    slot='2',
+    labware_json = custom_labware_def
+)
+# Load heater shaker module
+driver.load_module("heaterShakerModuleV1", slot="3")
+
 data = DataTiled(
     server="http://127.0.0.1:8000",
     api_key="devkey",
@@ -74,7 +88,6 @@ for stock_name, volume_text in target['volumes'].items():
     print(f"{stock_name}: {volume_ul} uL transferred from {source} -> {destination}")
 
 # set a specific temperature on the heater shaker module
-driver.load_module("heaterShakerModuleV1", slot="1")
 driver.set_shaker_temp(4)  # Set to 4°C
 current_temp, target_temp = driver.get_shaker_temp()
 print(f"Current: {current_temp}°C, Target: {target_temp}°C")
