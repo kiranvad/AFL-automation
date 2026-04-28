@@ -1,0 +1,122 @@
+{
+    "ordering": [
+        [
+            "A1",
+            "B1"
+        ],
+        [
+            "A2",
+            "B2"
+        ],
+        [
+            "A3",
+            "B3"
+        ]
+    ],
+    "brand": {
+        "brand": "Custom",
+        "brandId": []
+    },
+    "metadata": {
+        "displayName": "Ice Slurry Holder 20 mL 3x2",
+        "displayCategory": "tubeRack",
+        "displayVolumeUnits": "µL",
+        "tags": []
+    },
+    "dimensions": {
+        "xDimension": 127.5,
+        "yDimension": 85,
+        "zDimension": 42.5
+    },
+    "wells": {
+        "A1": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 25,
+            "y": 60,
+            "z": 0
+        },
+        "B1": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 25,
+            "y": 25,
+            "z": 0
+        },
+        "A2": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 63.75,
+            "y": 60,
+            "z": 0
+        },
+        "B2": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 63.75,
+            "y": 25,
+            "z": 0
+        },
+        "A3": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 102.5,
+            "y": 60,
+            "z": 0
+        },
+        "B3": {
+            "depth": 42.5,
+            "totalLiquidVolume": 20000,
+            "shape": "circular",
+            "diameter": 31,
+            "x": 102.5,
+            "y": 25,
+            "z": 0
+        }
+    },
+    "groups": [
+        {
+            "brand": {
+                "brand": "None",
+                "brandId": []
+            },
+            "metadata": {
+                "wellBottomShape": "flat",
+                "displayCategory": "tubeRack"
+            },
+            "wells": [
+                "A1",
+                "B1",
+                "A2",
+                "B2",
+                "A3",
+                "B3"
+            ]
+        }
+    ],
+    "parameters": {
+        "format": "irregular",
+        "quirks": [],
+        "isTiprack": false,
+        "isMagneticModuleCompatible": false,
+        "loadName": "ice_slurry_holder_20ml_3x2"
+    },
+    "namespace": "custom_beta",
+    "version": 1,
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+    }
+}
