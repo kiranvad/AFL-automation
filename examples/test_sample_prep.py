@@ -11,6 +11,13 @@ driver = OT2Prepare(
         "robot_port": "31950",
     }
 )
+# Tip racks
+driver.load_labware(name="opentrons_96_tiprack_300ul", slot="6")
+driver.load_labware(name="opentrons_96_tiprack_20ul", slot="7")
+
+# Pipettes
+driver.load_instrument(name="p300_single_gen2", mount="right", tip_rack_slots=["6"])
+driver.load_instrument(name="p20_single_gen2", mount="left", tip_rack_slots=["7"])
 # Load standard labware (e.g., a 96-well plate)
 # Load custom labware from JSON
 with open('./custom_labware/ice_slurry_holder.json', 'r') as f:
