@@ -5,39 +5,50 @@ import time
 import json
 
 # Create the driver instance
-driver = OT2Prepare(
-    overrides={
-        "robot_ip": "192.168.1.50",
-        "robot_port": "31950",
-    }
-)
-# Tip racks
-driver.load_labware(name="opentrons_96_tiprack_300ul", slot="6")
-driver.load_labware(name="opentrons_96_tiprack_20ul", slot="7")
+driver = OT2Prepare() # assumes the OT2 server is running with default settings (e.g.: via Andon)
+driver.reset_stocks()
+driver.reset_deck() # necssary to remove cache of modules and labware
+driver.reset()
 
-# Pipettes
-driver.load_instrument(name="p300_single_gen2", mount="right", tip_rack_slots=["6"])
-driver.load_instrument(name="p20_single_gen2", mount="left", tip_rack_slots=["7"])
-# Load standard labware (e.g., a 96-well plate)
+# Tip racks and Pipettes (Gen 1 P300 and gen 2 P20)
+driver.load_labware(name="opentrons_96_tiprack_300ul", slot="7")
+driver.load_instrument(name="p300_single", mount="right", tip_rack_slots=["7"])
+
+driver.load_labware(name="opentrons_96_tiprack_20ul", slot="8")
+driver.load_instrument(name="p20_single_gen2", mount="left", tip_rack_slots=["8"])
+
 # Load custom labware from JSON
-with open('./custom_labware/ice_slurry_holder.json', 'r') as f:
+with open('./ice_slurry_holder_20ml_3x2.json', 'r') as f:
     custom_labware_def = json.load(f)
 driver.load_labware(
     name='ice_slurry_holder',
     slot='1',
     labware_json = custom_labware_def
 )
+
 # Load heater shaker module
 heater_shaker_id = driver.load_module("heaterShakerModuleV1", slot="4")
 
-driver.open_labware_latch(module_id=heater_shaker_id)
+driver.unlatch_shaker(module_id=heater_shaker_id)
 driver.load_labware(
     name="nest_96_wellplate_2ml_deep",
     slot="4",
     module=heater_shaker_id,
 )
-driver.close_labware_latch(module_id=heater_shaker_id)
+driver.latch_shaker(module_id=heater_shaker_id)
+
+temp_module_id = driver.load_module("temperatureModuleV1", slot="3")
+
+driver.load_labware(
+    name="opentrons_24_aluminumblock_nest_1.5ml_snapcap",
+    slot="3",
+    module=temp_module_id,
+)
+
 driver.reset_stocks()
+driver.add_component(name="H2O", formula="H2O", density="1.0 g/ml")
+driver.add_component(name="YCl3", formula="YCl3")
+driver.add_component(name="BSA")  # formula optional if you only use mg/mL
 
 driver.add_stock({
     "name": "stock_BSA",
@@ -98,16 +109,25 @@ driver.set_shake(300, module_id=heater_shaker_id)
 time.sleep(5)
 driver.stop_shake(module_id=heater_shaker_id)
 
+def set_temp_module_temperature(driver, module_id, temperature_c, timeout_s=600, wait=True):
+    return driver._execute_atomic_command(
+        "temperatureModule/setTargetTemperature",
+        params={"moduleId": module_id, "celsius": float(temperature_c)},
+        wait_until_complete=wait,
+        timeout=timeout_s,
+    )
+
+def deactivate_temp_module(driver, module_id, timeout_s=120, wait=True):
+    return driver._execute_atomic_command(
+        "temperatureModule/deactivate",
+        params={"moduleId": module_id},
+        wait_until_complete=wait,
+        timeout=timeout_s,
+    )
 # Step through temperatures
 for temp_c in [30, 60, 80]:
-    print(f"Setting heater-shaker to {temp_c} C")
-    driver.set_shaker_temp(temp_c, module_id=heater_shaker_id)
-    wait_for_temperature(driver, temp_c, tolerance_c=1.0, timeout_s=900, poll_s=5)
+    print(f"Setting sample temperature to {temp_c} C")
+    set_temp_module_temperature(driver, temp_module_id, temp_c)
+    deactivate_temp_module(driver, temp_module_id)
 
-    # Optional brief gentle mix at each temperature
-    driver.set_shake(300, module_id=heater_shaker_id)
-    time.sleep(5)
-    driver.stop_shake(module_id=heater_shaker_id)
-
-driver.stop_shaker_heat(module_id=heater_shaker_id)
 
