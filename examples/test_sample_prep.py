@@ -158,6 +158,7 @@ driver.stop_shake(module_id=heater_shaker_id)
 for temp_c in [30, 60, 80]:
     print(f"Setting sample temperature to {temp_c} C")
     set_temp_module_temperature(driver, temp_module_id, temp_c)
-    deactivate_temp_module(driver, temp_module_id)
+
+deactivate_temp_module(driver, temp_module_id)
 
 
