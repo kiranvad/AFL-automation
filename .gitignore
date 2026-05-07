@@ -78,3 +78,6 @@ htmlcov/
 
 # Hypothesis
 .hypothesis/
+
+# ignore xarm json's
+examples/xarm/*.json

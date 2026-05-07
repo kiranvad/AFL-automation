@@ -14,9 +14,8 @@ def interpolate(a, b, steps):
         yield (a + (b - a) * i / steps).tolist()
 
 
-def play_trajectory(arm):
+def play_trajectory(arm, filename):
 
-    filename = input("Trajectory file to play: ").strip()
     if not filename:
         print("No file provided.")
         return
@@ -30,16 +29,25 @@ def play_trajectory(arm):
 
     arm.clean_warn()
     arm.clean_error()
-
     arm.motion_enable(True)
 
-    # Stop previous motion safely
-    arm.set_state(4)
-    time.sleep(0.3)
+    arm.set_state(4) # reset
+    time.sleep(1.0)
 
-    # Servo streaming mode
+    # Make the iniital move to the start of the trajectory in position control mode for safety
+    arm.set_mode(0)
+    arm.set_state(0) # ready
+    time.sleep(1.0)
+
+    _, pose_start = arm.get_forward_kinematics(trajectory[0])
+    _, pose_current = arm.get_position(is_radian=False)
+    print(f"Moving to trajectory start position: {pose_start} from current position: {pose_current}")
+    arm.set_position(*pose_start, wait=True)
+
+    # Servo mode
     arm.set_mode(1)
-    arm.set_state(0)
+    arm.set_state(0) # ready
+    time.sleep(1.0)
 
     print(f"Playing {len(trajectory)} points (smoothed)...")
 
@@ -67,14 +75,13 @@ def play_trajectory(arm):
         print("Playback interrupted")
 
     finally:
-        # Always return to safe state
-        arm.set_state(4)
-        time.sleep(0.2)
+        # return to safe state
+        time.sleep(1.0)
         arm.set_mode(0)
         arm.set_state(0)
 
         print("Playback finished and robot reset")
 
-
 if __name__ == "__main__":
-    play_trajectory(arm)
+    filename = input("Trajectory file to play: ").strip()
+    play_trajectory(arm, filename)
