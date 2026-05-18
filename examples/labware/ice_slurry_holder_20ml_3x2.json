@@ -18,7 +18,7 @@
         "brandId": []
     },
     "metadata": {
-        "displayName": "Ice Slurry Holder 20 mL 3x2",
+        "displayName": "Ice Slurry Holder 20 mL Vials",
         "displayCategory": "tubeRack",
         "displayVolumeUnits": "µL",
         "tags": []
@@ -26,69 +26,71 @@
     "dimensions": {
         "xDimension": 127.5,
         "yDimension": 85,
-        "zDimension": 62
+        "zDimension": 62.5
     },
     "wells": {
         "A1": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 25,
             "y": 60,
-            "z": 0
+            "z": 7.5
         },
         "B1": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 25,
             "y": 25,
-            "z": 0
+            "z": 7.5
         },
         "A2": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 63.75,
             "y": 60,
-            "z": 0
+            "z": 7.5
         },
         "B2": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 63.75,
             "y": 25,
-            "z": 0
+            "z": 7.5
         },
         "A3": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 102.5,
             "y": 60,
-            "z": 0
+            "z": 7.5
         },
         "B3": {
-            "depth": 62,
+            "depth": 55,
             "totalLiquidVolume": 20000,
             "shape": "circular",
             "diameter": 31,
             "x": 102.5,
             "y": 25,
-            "z": 0
+            "z": 7.5
         }
     },
     "groups": [
         {
             "brand": {
-                "brand": "None",
-                "brandId": []
+                "brand": "NIST AFL",
+                "brandId": [
+                    "1"
+                ]
             },
             "metadata": {
                 "wellBottomShape": "flat",

@@ -1,3 +1,19 @@
+"""
+Test script for preparing samples on the OT2 using the OT2Prepare driver. 
+This example demonstrates 
+how to set up the robot, 
+define stocks and targets, 
+and execute a preparation protocol that includes temperature control and shaking.
+
+You require the OT2 to be connected via ethernet (USB-B or LAN) with atleast the following firmware version:
+    - Firmware Version v1.1.0-25e5cea
+    - Supported Protocol API Versions v2.0 - v2.28
+
+You are going to need the IP address of your OT2, which you can find in the Opentrons app under Network settings (use GPT to find it if you have trouble). 
+Update the `robot_ip` field in the driver initialization below with your OT2's IP address. The port should be `31950` by default unless you have changed it.
+
+"""
+
 from AFL.automation.prepare.OT2Prepare import OT2Prepare
 
 import numpy as np
@@ -6,24 +22,29 @@ import json
 import requests
 
 # Create the driver instance
-driver = OT2Prepare() # assumes the OT2 server is running with default settings (e.g.: via Andon)
+driver = OT2Prepare(
+    overrides={
+        "robot_ip": "169.254.59.185",
+        "robot_port": "31950",
+    }
+)
 driver.reset_stocks()
 driver.reset_deck() # necssary to remove cache of modules and labware
 driver.reset()
 
-# Tip racks and Pipettes (Gen 1 P300 and gen 2 P20)
-driver.load_labware(name="opentrons_96_tiprack_300ul", slot="7")
-driver.load_instrument(name="p300_single", mount="right", tip_rack_slots=["7"])
+# Tip racks and Pipettes (Gen 2 P1000 and gen 2 P20)
+driver.load_labware(name="geb_96_tiprack_1000ul", slot="10")
+driver.load_instrument(name="p1000_single_gen2", mount="right", tip_rack_slots=["10"])
 
-driver.load_labware(name="opentrons_96_tiprack_20ul", slot="8")
-driver.load_instrument(name="p20_single_gen2", mount="left", tip_rack_slots=["8"])
+driver.load_labware(name="geb_96_tiprack_10ul", slot="11")
+driver.load_instrument(name="p20_single_gen2", mount="left", tip_rack_slots=["11"])
 
 # Load custom labware from JSON
-with open('./ice_slurry_holder_20ml_3x2.json', 'r') as f:
+with open('./labware/ice_slurry_holder_20ml_3x2.json', 'r') as f:
     custom_labware_def = json.load(f)
 driver.load_labware(
     name='ice_slurry_holder',
-    slot='1',
+    slot='2',
     labware_json = custom_labware_def
 )
 
@@ -32,16 +53,25 @@ heater_shaker_id = driver.load_module("heaterShakerModuleV1", slot="4")
 
 driver.unlatch_shaker(module_id=heater_shaker_id)
 driver.load_labware(
-    name="opentrons_24_aluminumblock_nest_1.5ml_snapcap",
+    name="opentrons_96_deep_well_adapter",
+    slot="4",
+    module=heater_shaker_id,
+)
+driver.load_labware(
+    name="nest_96_wellplate_2ml_deep",
     slot="4",
     module=heater_shaker_id,
 )
 driver.latch_shaker(module_id=heater_shaker_id)
 
 temp_module_id = driver.load_module("temperatureModuleV1", slot="3")
+# Load custom vial holder labware onto the temperature module
+with open('./labware/5ml_vial_holder_1x1_hightemp.json', 'r') as f:
+    vial_holder_def = json.load(f)
 driver.load_labware(
-    name="opentrons_24_aluminumblock_nest_1.5ml_snapcap",
-    slot="3",
+    name='vial_holder',
+    slot='3',
+    labware_json = vial_holder_def,
     module=temp_module_id,
 )
 
@@ -52,7 +82,7 @@ driver.add_component(name="BSA")  # formula optional if you only use mg/mL
 
 driver.add_stock({
     "name": "stock_BSA",
-    "location": "1A1",
+    "location": "2A1",
     "concentrations": {"BSA": "200 mg/ml"},
     "volumes": {"H2O": "20 ml"},
     "total_volume": "20 ml",
@@ -61,7 +91,7 @@ driver.add_stock({
 
 driver.add_stock({
     "name": "stock_YCl3",
-    "location": "1A2",
+    "location": "2A2",
     "molarities": {"YCl3": "1 mol/L"},
     "volumes": {"H2O": "10 ml"},
     "total_volume": "10 ml",
@@ -70,7 +100,7 @@ driver.add_stock({
 
 driver.add_stock({
     "name": "stock_H2O",
-    "location": "1A3",
+    "location": "2A3",
     "volumes": {"H2O": "20 ml"},
     "total_volume": "20 ml",
 })
@@ -82,7 +112,7 @@ target = {
     "volumes": {"H2O": "1 ml"},
     "total_volume": "1 ml",
     "solutes": ["BSA", "YCl3"],
-    "location": "1B1",
+    "location": "4A1",
 }
 
 def set_temp_module_temperature(
@@ -144,13 +174,13 @@ def deactivate_temp_module(driver, module_id, timeout_s=120, wait=True):
 feasible = driver.is_feasible(target)[0]
 print("Feasible solution:", feasible)
 
-result, dest = driver.prepare(target, dest="4A1")
+result, dest = driver.prepare(target, dest="3A1")
 print("Prepared at:", dest)
 print("Planned mass transfers:", result["planned_mass_transfers"])
 print("Executed transfers:", result["executed_transfers"])
 
 # Gently mix the prepared sample in the heater-shaker plate
-driver.set_shake(300, module_id=heater_shaker_id)
+driver.set_shake(400, module_id=heater_shaker_id)
 time.sleep(5)
 driver.stop_shake(module_id=heater_shaker_id)
 

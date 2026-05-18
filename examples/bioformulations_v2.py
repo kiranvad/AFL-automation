@@ -17,10 +17,10 @@ driver = OT2Prepare(
 # Load standard labware (e.g., a 96-well plate)
 driver.load_labware(name='corning_96_wellplate_360ul_flat', slot='1')
 # Load custom labware from JSON
-with open('./custom_labware/ice_slurry_holder.json', 'r') as f:
+with open('./ice_slurry_holder_20ml_3x2.json', 'r') as f:
     custom_labware_def = json.load(f)
 driver.load_labware(
-    name=custom_labware_def['name'],
+    name='ice_slurry_holder',
     slot='2',
     labware_json = custom_labware_def
 )

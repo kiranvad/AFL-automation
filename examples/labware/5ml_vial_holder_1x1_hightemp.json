@@ -1,0 +1,72 @@
+{
+    "ordering": [
+        [
+            "A1"
+        ]
+    ],
+    "brand": {
+        "brand": "NIST AFL",
+        "brandId": [
+            "2"
+        ]
+    },
+    "metadata": {
+        "displayName": "High Temperature 5mL Vial Holder",
+        "displayCategory": "wellPlate",
+        "displayVolumeUnits": "µL",
+        "tags": []
+    },
+    "dimensions": {
+        "xDimension": 127.5,
+        "yDimension": 85,
+        "zDimension": 47
+    },
+    "wells": {
+        "A1": {
+            "depth": 47,
+            "totalLiquidVolume": 5000,
+            "shape": "circular",
+            "diameter": 14.5,
+            "x": 62.52,
+            "y": 45.67,
+            "z": 0
+        }
+    },
+    "groups": [
+        {
+            "metadata": {
+                "wellBottomShape": "flat"
+            },
+            "wells": [
+                "A1"
+            ]
+        }
+    ],
+    "parameters": {
+        "format": "irregular",
+        "quirks": [],
+        "isTiprack": false,
+        "isMagneticModuleCompatible": false,
+        "loadName": "5ml_vial_holder_1x1_hightemp"
+    },
+    "namespace": "custom_beta",
+    "version": 1,
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+    },
+    "stackingOffsetWithLabware": {
+        "opentrons_aluminum_flat_bottom_plate": {
+            "x": 0,
+            "y": 0,
+            "z": 58.2
+        },
+        "opentrons_universal_flat_adapter": {
+            "x": 0,
+            "y": 0,
+            "z": 59
+        }
+    }
+}
