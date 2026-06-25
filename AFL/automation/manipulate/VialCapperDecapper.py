@@ -158,6 +158,28 @@ class VialCapperDecapper(Driver):
         overrides: Optional[Dict[str, Any]] = None,
         name: str = "VialCapperDecapper",
     ) -> None:
+        """
+        Initialize the vial capper and decapper driver.
+
+        Parameters
+        ----------
+        servo_motor : ServoMotor, optional
+            Pre-configured servo helper used to grip and release caps.
+        stepper_motor : StepperMotor, optional
+            Pre-configured stepper helper used to rotate caps.
+        xarm_client : Client, optional
+            AFL client connected to a running xArm server.
+        overrides : dict, optional
+            Driver configuration overrides merged with :attr:`defaults`.
+        name : str, default="VialCapperDecapper"
+            Driver name registered with the AFL server.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> driver.connected
+        False
+        """
         self._app = None
         self._data = None
         Driver.__init__(self, name=name, defaults=self.gather_defaults(), overrides=overrides)
@@ -173,10 +195,26 @@ class VialCapperDecapper(Driver):
 
     @property
     def app(self):
+        """
+        Return the attached AFL application object.
+
+        Returns
+        -------
+        object
+            Application object propagated to helper components.
+        """
         return self._app
 
     @app.setter
     def app(self, app):
+        """
+        Attach an AFL application object to the driver and helpers.
+
+        Parameters
+        ----------
+        app : object
+            Application object to propagate to the owned motor helpers.
+        """
         self._app = app
         for helper in (self.servo, self.stepper):
             if helper is not None and hasattr(helper, "app"):
@@ -184,10 +222,26 @@ class VialCapperDecapper(Driver):
 
     @property
     def data(self):
+        """
+        Return the attached AFL data object.
+
+        Returns
+        -------
+        object
+            Data object propagated to helper components.
+        """
         return self._data
 
     @data.setter
     def data(self, data):
+        """
+        Attach an AFL data object to the driver and helpers.
+
+        Parameters
+        ----------
+        data : object
+            Data object to propagate to the owned motor helpers.
+        """
         self._data = data
         for helper in (self.servo, self.stepper):
             if helper is not None and hasattr(helper, "data"):
@@ -215,10 +269,26 @@ class VialCapperDecapper(Driver):
         'Attached provided xArm client'
         """
         self.xarm_client = xarm_client
+        self.logger.debug("Attached xArm client: %s", xarm_client)
         return "Attached provided xArm client"
 
     @Driver.unqueued()
     def connect(self) -> str:
+        """
+        Connect the underlying stepper helper.
+
+        Returns
+        -------
+        str
+            Confirmation string indicating that the driver is connected.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> driver.connect()
+        'connected'
+        """
+        self.logger.debug("Connecting stepper motor for vial capper")
         self.stepper.connect()
         self.connected = True
         self.log_info("VialCapperDecapper connected")
@@ -226,6 +296,27 @@ class VialCapperDecapper(Driver):
 
     @Driver.unqueued()
     def home(self, open_gripper: bool = True) -> Dict[str, Any]:
+        """
+        Reset the driver to its software home state.
+
+        Parameters
+        ----------
+        open_gripper : bool, default=True
+            If ``True``, open the servo gripper before resetting the tracked
+            stepper position.
+
+        Returns
+        -------
+        dict
+            Current driver status after homing.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver.home(open_gripper=False), dict)
+        True
+        """
+        self.logger.debug("Homing vial capper with open_gripper=%s", open_gripper)
         if open_gripper:
             self.servo.open(speed=self.config["servo_speed"])
         self.stepper.home()
@@ -235,6 +326,27 @@ class VialCapperDecapper(Driver):
 
     @Driver.unqueued()
     def set_grip_angle(self, vial_type: str, angle: int) -> Dict[str, int]:
+        """
+        Store a servo grip angle for a named vial type.
+
+        Parameters
+        ----------
+        vial_type : str
+            Vial type name used as the lookup key in ``grip_map``.
+        angle : int
+            Servo angle in degrees used to grip that vial type.
+
+        Returns
+        -------
+        dict
+            Updated grip-angle mapping.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> driver.set_grip_angle("sample_vial", 72)["sample_vial"]
+        72
+        """
         grip_map = dict(self.config["grip_map"])
         grip_map[vial_type] = angle
         self.config["grip_map"] = grip_map
@@ -281,10 +393,33 @@ class VialCapperDecapper(Driver):
 
     @Driver.unqueued()
     def clear_held_cap(self) -> None:
+        """
+        Clear any stored metadata for a currently held cap.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> driver.clear_held_cap()
+        """
         self.held_cap = None
 
     @Driver.unqueued()
     def status(self) -> Dict[str, Any]:
+        """
+        Return the current driver, helper, and xArm state.
+
+        Returns
+        -------
+        dict
+            Summary of connection state, held-cap metadata, helper status, and
+            configured xArm locations.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver.status(), dict)
+        True
+        """
         return {
             "connected": self.connected,
             "held_cap": self.held_cap,
@@ -309,6 +444,39 @@ class VialCapperDecapper(Driver):
         cap_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Run a decapping sequence.
+
+        Parameters
+        ----------
+        grip_angle : int, optional
+            Explicit servo grip angle used for the cap.
+        rotations : float, optional
+            Override for the total number of thread turns.
+        servo_speed : float, optional
+            Servo speed in degrees per second.
+        stepper_speed : float, optional
+            Stepper speed in revolutions per second.
+        vial_location : str, optional
+            Named xArm grip location for the vial.
+        approach_location : str, optional
+            Named xArm safe approach and retreat location.
+        cap_id : str, optional
+            Identifier stored with the held-cap metadata.
+        metadata : dict, optional
+            Additional metadata stored in the sequence summary.
+
+        Returns
+        -------
+        dict
+            Driver status after the decap sequence completes.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver.decap(), dict)
+        True
+        """
         return self.run_sequence(
             action="decap",
             grip_angle=grip_angle,
@@ -332,6 +500,37 @@ class VialCapperDecapper(Driver):
         approach_location: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Run a capping sequence.
+
+        Parameters
+        ----------
+        grip_angle : int, optional
+            Explicit servo grip angle used for the cap.
+        rotations : float, optional
+            Override for the total number of thread turns.
+        servo_speed : float, optional
+            Servo speed in degrees per second.
+        stepper_speed : float, optional
+            Stepper speed in revolutions per second.
+        vial_location : str, optional
+            Named xArm grip location for the vial.
+        approach_location : str, optional
+            Named xArm safe approach and retreat location.
+        metadata : dict, optional
+            Additional metadata stored in the sequence summary.
+
+        Returns
+        -------
+        dict
+            Driver status after the cap sequence completes.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver.cap(), dict)
+        True
+        """
         return self.run_sequence(
             action="cap",
             grip_angle=grip_angle,
@@ -367,8 +566,7 @@ class VialCapperDecapper(Driver):
             Explicit servo angle used to grip the cap.
         rotations : float, optional
             Override for the total number of thread turns to execute. When not
-            provided, ``vial_spec['thread_turns']`` or the vial-specific
-            override is used.
+            provided, ``vial_spec['thread_turns']`` is used.
         servo_speed : float, optional
             Servo speed in degrees per second. Defaults to ``servo_speed`` from
             the driver configuration.
@@ -418,6 +616,18 @@ class VialCapperDecapper(Driver):
         resolved_grip_location = self.config["xarm_grip_location"] if vial_location is None else vial_location
         resolved_safe_location = self.config["xarm_safe_location"] if approach_location is None else approach_location
 
+        self.logger.debug(
+            "Starting %s sequence with grip_angle=%s rotations=%s servo_speed=%s stepper_speed=%s grip_location=%s safe_location=%s vial_spec=%s",
+            action,
+            resolved_grip_angle,
+            resolved_rotations,
+            resolved_servo_speed,
+            resolved_stepper_speed,
+            resolved_grip_location,
+            resolved_safe_location,
+            resolved_vial_spec,
+        )
+
         if any(value is not None for value in (resolved_grip_location, resolved_safe_location)):
             self._require_xarm_client()
 
@@ -425,13 +635,17 @@ class VialCapperDecapper(Driver):
             grip_location=resolved_grip_location,
             safe_location=resolved_safe_location,
         )
+        self.logger.debug("Stage result for %s: %s", action, stage_result)
 
         if self.config["pre_grip_delay"] > 0:
+            self.logger.debug("Sleeping pre-grip delay: %s s", self.config["pre_grip_delay"])
             time.sleep(self.config["pre_grip_delay"])
 
+        self.logger.debug("Closing servo to grip angle %s at speed %s", resolved_grip_angle, resolved_servo_speed)
         self.servo.set_angle(resolved_grip_angle, speed=resolved_servo_speed)
 
         if self.config["post_grip_delay"] > 0:
+            self.logger.debug("Sleeping post-grip delay: %s s", self.config["post_grip_delay"])
             time.sleep(self.config["post_grip_delay"])
 
         motion_result = self._coordinate_threaded_rotation_and_xarm(
@@ -441,6 +655,7 @@ class VialCapperDecapper(Driver):
             grip_location=resolved_grip_location,
             safe_location=resolved_safe_location,
         )
+        self.logger.debug("Motion result for %s: %s", action, motion_result)
 
         if action == "decap":
             self.held_cap = {
@@ -449,16 +664,21 @@ class VialCapperDecapper(Driver):
                 "rotations": resolved_rotations,
                 "metadata": {} if metadata is None else metadata,
             }
+            self.logger.debug("Stored held cap metadata: %s", self.held_cap)
             if self.config["auto_open_after_unscrew"]:
+                self.logger.debug("Auto-opening servo after decap at speed %s", resolved_servo_speed)
                 self.servo.open(speed=resolved_servo_speed)
         else:
             if self.config["require_cap_presence_for_screw"] and self.held_cap is None:
                 raise RuntimeError("No held cap is available for capping")
             if self.config["auto_open_after_screw"]:
+                self.logger.debug("Auto-opening servo after cap at speed %s", resolved_servo_speed)
                 self.servo.open(speed=resolved_servo_speed)
+            self.logger.debug("Clearing held cap metadata after cap")
             self.held_cap = None
 
         clear_result = self._clear_capper(safe_location=resolved_safe_location)
+        self.logger.debug("Clear result for %s: %s", action, clear_result)
         self.last_sequence = {
             "action": action,
             "grip_angle": resolved_grip_angle,
@@ -477,6 +697,26 @@ class VialCapperDecapper(Driver):
         return self.status()
 
     def _resolve_grip_angle(self, grip_angle: Optional[int]) -> int:
+        """
+        Resolve the servo angle used to grip the cap.
+
+        Parameters
+        ----------
+        grip_angle : int, optional
+            Explicit grip angle override.
+
+        Returns
+        -------
+        int
+            Provided grip angle when available, otherwise the servo helper's
+            configured closed angle.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver._resolve_grip_angle(None), int)
+        True
+        """
         if grip_angle is not None:
             return grip_angle
         return self.servo.close_angle
@@ -516,20 +756,60 @@ class VialCapperDecapper(Driver):
         if vial_spec["rotation_segment_turns"] is None or vial_spec["rotation_segment_turns"] <= 0:
             raise ValueError("rotation_segment_turns must be greater than zero")
 
+        self.logger.debug("Resolved vial specification: %s", vial_spec)
         return vial_spec
 
     def _require_xarm_client(self) -> Client:
+        """
+        Return the attached xArm client or raise an error.
+
+        Returns
+        -------
+        Client
+            Attached AFL client used for xArm motion commands.
+
+        Raises
+        ------
+        RuntimeError
+            Raised when no xArm client has been attached.
+        """
         if self.xarm_client is None:
             raise RuntimeError("An xArm client must be attached before using location-based capping sequences")
         return self.xarm_client
 
     def _move_xarm(self, location: str, above: bool) -> Dict[str, Any]:
+        """
+        Queue and wait for a named xArm move.
+
+        Parameters
+        ----------
+        location : str
+            Named xArm location to move to.
+        above : bool
+            Motion mode flag forwarded to the xArm server to indicate whether the
+            move should approach above or below the named location.
+
+        Returns
+        -------
+        dict
+            Summary containing the target location, approach mode, and queue
+            UUID.
+
+        Raises
+        ------
+        RuntimeError
+            Raised when no xArm client is attached or when the xArm server does
+            not return a queue UUID.
+        """
         client = self._require_xarm_client()
+        self.logger.debug("Queueing xArm move to location=%s above=%s", location, above)
         response = client.enqueue(task_name="move", interactive=True, location=location, above=above)
         uuid = response.get("uuid")
         if uuid is None:
             raise RuntimeError(f"xArm move command did not return a queue uuid for location {location}")
+        self.logger.debug("Waiting for xArm move uuid=%s location=%s above=%s", uuid, location, above)
         client.wait(uuid, timeout=self.config["xarm_move_timeout"])
+        self.logger.debug("Completed xArm move uuid=%s location=%s above=%s", uuid, location, above)
         return {"location": location, "above": above, "uuid": uuid}
 
     def _move_xarm_axis(
@@ -569,6 +849,13 @@ class VialCapperDecapper(Driver):
         if location is None and require_location:
             raise RuntimeError("A grip location is required for threaded xArm axial moves")
 
+        self.logger.debug(
+            "Queueing xArm axis move location=%s axis=%s delta_mm=%s require_location=%s",
+            location,
+            axis,
+            delta_mm,
+            require_location,
+        )
         response = client.enqueue(
             task_name="move_axis",
             interactive=True,
@@ -579,7 +866,9 @@ class VialCapperDecapper(Driver):
         uuid = response.get("uuid")
         if uuid is None:
             raise RuntimeError(f"xArm axis move command did not return a queue uuid for axis {axis}")
+        self.logger.debug("Waiting for xArm axis move uuid=%s axis=%s delta_mm=%s", uuid, axis, delta_mm)
         client.wait(uuid, timeout=self.config["xarm_move_timeout"])
+        self.logger.debug("Completed xArm axis move uuid=%s axis=%s delta_mm=%s", uuid, axis, delta_mm)
         return {
             "location": location,
             "axis": axis,
@@ -592,6 +881,32 @@ class VialCapperDecapper(Driver):
         grip_location: Optional[str],
         safe_location: Optional[str],
     ) -> Dict[str, Any]:
+        """
+        Move the xArm from the safe location into the grip location.
+
+        Parameters
+        ----------
+        grip_location : str, optional
+            Named xArm location where the vial engages the gripper.
+        safe_location : str, optional
+            Named xArm location used as the safe approach waypoint.
+
+        Returns
+        -------
+        dict
+            Summary of the staging locations and queued xArm moves.
+
+        Notes
+        -----
+        When ``xarm_approach_from_below`` is enabled, the final move into the
+        grip location uses ``above=False``.
+        """
+        self.logger.debug(
+            "Staging vial for capper with safe_location=%s grip_location=%s approach_from_below=%s",
+            safe_location,
+            grip_location,
+            self.config["xarm_approach_from_below"],
+        )
         moves = []
         if safe_location is not None:
             moves.append(self._move_xarm(safe_location, above=True))
@@ -655,10 +970,31 @@ class VialCapperDecapper(Driver):
         remaining_turns = total_turns
         segments = []
 
+        self.logger.debug(
+            "Coordinating threaded motion action=%s total_turns=%s segment_turns=%s thread_pitch=%s stepper_speed=%s grip_location=%s safe_location=%s",
+            action,
+            total_turns,
+            segment_turns,
+            thread_pitch,
+            stepper_speed,
+            grip_location,
+            safe_location,
+        )
+
         for segment_index in range(segment_count):
             current_turns = min(segment_turns, remaining_turns)
             axial_travel_mm = current_turns * thread_pitch
+            self.logger.debug(
+                "Thread segment %s/%s action=%s current_turns=%s axial_travel_mm=%s remaining_before=%s",
+                segment_index + 1,
+                segment_count,
+                action,
+                current_turns,
+                axial_travel_mm,
+                remaining_turns,
+            )
             if action == "decap":
+                self.logger.debug("Stepper rotate_ccw turns=%s speed=%s", current_turns, stepper_speed)
                 self.stepper.rotate_ccw(current_turns, speed=stepper_speed)
                 xarm_move = self._move_xarm_axis(
                     location=grip_location,
@@ -673,6 +1009,7 @@ class VialCapperDecapper(Driver):
                     delta_mm=-axial_travel_mm,
                     require_location=segment_index == 0,
                 )
+                self.logger.debug("Stepper rotate_cw turns=%s speed=%s", current_turns, stepper_speed)
                 self.stepper.rotate_cw(current_turns, speed=stepper_speed)
 
             segments.append(
@@ -684,14 +1021,18 @@ class VialCapperDecapper(Driver):
                 }
             )
             remaining_turns -= current_turns
+            self.logger.debug("Completed thread segment %s remaining_turns=%s", segment_index + 1, remaining_turns)
 
         retreat_moves = []
         if action == "decap" and grip_location is not None:
             if self.config["xarm_remove_by_lowering"]:
+                self.logger.debug("Retreating after decap by lowering at grip_location=%s", grip_location)
                 retreat_moves.append(self._move_xarm(grip_location, above=False))
             else:
+                self.logger.debug("Retreating after decap upward at grip_location=%s", grip_location)
                 retreat_moves.append(self._move_xarm(grip_location, above=True))
         if safe_location is not None and self.config["xarm_return_to_safe_after_rotation"]:
+            self.logger.debug("Returning xArm to safe location after rotation: %s", safe_location)
             retreat_moves.append(self._move_xarm(safe_location, above=True))
 
         return {
@@ -715,6 +1056,12 @@ class VialCapperDecapper(Driver):
         -------
         dict
             Summary of the retreat moves issued to the xArm.
+
+        Examples
+        --------
+        >>> driver = VialCapperDecapper()
+        >>> isinstance(driver._clear_capper(None), dict)
+        True
         """
         moves = []
         if safe_location is not None:

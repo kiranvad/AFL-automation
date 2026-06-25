@@ -147,6 +147,17 @@ class ServoMotor(Motor):
         self.ServoKit = lazy.load("adafruit_servokit.ServoKit", require="adafruit-circuitpython-servokit")
         self.kit = self.ServoKit(channels=self.channels, address=self.address)
         self.kit.servo[self.channel].set_pulse_width_range(self.pulse_min, self.pulse_max)
+        self.logger.debug(
+            "Initialized servo motor channel=%s address=%s bus=%s angle_range=(%s,%s) pulse_range=(%s,%s) default_speed=%s",
+            self.channel,
+            self.address,
+            self.bus,
+            self.min_angle,
+            self.max_angle,
+            self.pulse_min,
+            self.pulse_max,
+            self.default_speed,
+        )
 
         if config["register_cleanup"]:
             atexit.register(self.cleanup)
@@ -170,7 +181,15 @@ class ServoMotor(Motor):
         >>> servo.set_angle(30)
         >>> servo.set_angle(60, speed=20.0)
         """
+        requested_angle = angle
         angle = max(self.min_angle, min(self.max_angle, angle))
+        self.logger.debug(
+            "Servo set_angle requested=%s clamped=%s current=%s speed=%s",
+            requested_angle,
+            angle,
+            self.angle,
+            speed,
+        )
         if self.angle is None or speed <= 0.0:
             self.kit.servo[self.channel].angle = angle
             self.angle = angle
@@ -183,11 +202,20 @@ class ServoMotor(Motor):
         delta = angle - current_angle
         steps = int(abs(delta))
         if steps == 0:
+            self.logger.debug("Servo already at requested angle %s", angle)
             return
 
         speed = max(1.0, speed)
         step_delay = max((1.0 / speed) / steps, 0.005)
         step_direction = 1 if delta > 0 else -1
+        self.logger.debug(
+            "Servo ramping channel=%s delta=%s steps=%s step_direction=%s step_delay=%s",
+            self.channel,
+            delta,
+            steps,
+            step_direction,
+            step_delay,
+        )
 
         for _ in range(steps):
             current_angle += step_direction
@@ -212,7 +240,9 @@ class ServoMotor(Motor):
         >>> servo = ServoMotor(open_angle=10)
         >>> servo.open()
         """
-        self.set_angle(self.open_angle, speed=self.default_speed if speed is None else speed)
+        resolved_speed = self.default_speed if speed is None else speed
+        self.logger.debug("Opening servo to angle=%s speed=%s", self.open_angle, resolved_speed)
+        self.set_angle(self.open_angle, speed=resolved_speed)
 
     def close(self, speed: Optional[float] = None) -> None:
         """
@@ -228,7 +258,9 @@ class ServoMotor(Motor):
         >>> servo = ServoMotor(close_angle=80)
         >>> servo.close(speed=45.0)
         """
-        self.set_angle(self.close_angle, speed=self.default_speed if speed is None else speed)
+        resolved_speed = self.default_speed if speed is None else speed
+        self.logger.debug("Closing servo to angle=%s speed=%s", self.close_angle, resolved_speed)
+        self.set_angle(self.close_angle, speed=resolved_speed)
 
     def status(self) -> Dict[str, object]:
         """
@@ -268,11 +300,32 @@ class ServoMotor(Motor):
         >>> servo.cleanup()
         """
         try:
+            self.logger.debug("Cleaning up servo channel=%s", self.channel)
             self.kit.servo[self.channel].angle = None
         except Exception:
             self.logger.debug("Servo cleanup failed")
 
     def _state_from_angle(self, angle: int) -> str:
+        """
+        Map a servo angle to a human-readable state label.
+
+        Parameters
+        ----------
+        angle : int
+            Servo angle in degrees.
+
+        Returns
+        -------
+        str
+            ``"open"`` when the angle matches ``open_angle``, ``"closed"``
+            when it matches ``close_angle``, otherwise ``"partial"``.
+
+        Examples
+        --------
+        >>> servo = ServoMotor(register_cleanup=False)
+        >>> servo._state_from_angle(servo.open_angle)
+        'open'
+        """
         if angle == self.open_angle:
             return "open"
         if angle == self.close_angle:
@@ -363,6 +416,15 @@ class StepperMotor(Motor):
         self.position = 0
         self.connected = False
         self.GPIO = lazy.load("RPi.GPIO", require="AFL-automation[rpi-gpio]")
+        self.logger.debug(
+            "Initialized stepper motor step_pin=%s dir_pin=%s steps_per_rev=%s step_delay=%s default_speed=%s mode=%s",
+            self.step_pin,
+            self.dir_pin,
+            self.steps_per_rev,
+            self.step_delay,
+            self.default_speed,
+            self.mode,
+        )
 
         if config["register_cleanup"]:
             atexit.register(self.cleanup)
@@ -382,8 +444,10 @@ class StepperMotor(Motor):
         >>> motor.connect()
         """
         if self.connected:
+            self.logger.debug("Stepper already connected on STEP=%s DIR=%s", self.step_pin, self.dir_pin)
             return
 
+        self.logger.debug("Connecting stepper with mode=%s", self.mode)
         self.GPIO.setwarnings(False)
         if self.mode == "BCM":
             self.GPIO.setmode(self.GPIO.BCM)
@@ -407,8 +471,10 @@ class StepperMotor(Motor):
         >>> motor.cleanup()
         """
         if not self.connected:
+            self.logger.debug("Stepper cleanup skipped because motor is not connected")
             return
         try:
+            self.logger.debug("Cleaning up stepper STEP=%s DIR=%s", self.step_pin, self.dir_pin)
             self.GPIO.output(self.step_pin, self.GPIO.LOW)
             self.GPIO.output(self.dir_pin, self.GPIO.LOW)
             self.GPIO.cleanup((self.step_pin, self.dir_pin))
@@ -442,10 +508,17 @@ class StepperMotor(Motor):
         >>> motor.connect()
         >>> motor.rotate_cw(0.25)
         """
+        resolved_speed = self.default_speed if speed is None else speed
+        self.logger.debug(
+            "Requested clockwise rotation rotations=%s speed=%s step_delay=%s",
+            rotations,
+            resolved_speed,
+            step_delay,
+        )
         self._step(
             direction=self.GPIO.HIGH,
             rotations=rotations,
-            speed=self.default_speed if speed is None else speed,
+            speed=resolved_speed,
             step_delay=step_delay,
         )
 
@@ -474,10 +547,17 @@ class StepperMotor(Motor):
         >>> motor.connect()
         >>> motor.rotate_ccw(0.25, speed=1.5)
         """
+        resolved_speed = self.default_speed if speed is None else speed
+        self.logger.debug(
+            "Requested counterclockwise rotation rotations=%s speed=%s step_delay=%s",
+            rotations,
+            resolved_speed,
+            step_delay,
+        )
         self._step(
             direction=self.GPIO.LOW,
             rotations=rotations,
-            speed=self.default_speed if speed is None else speed,
+            speed=resolved_speed,
             step_delay=step_delay,
         )
 
@@ -495,6 +575,7 @@ class StepperMotor(Motor):
         >>> motor = StepperMotor()
         >>> motor.home()
         """
+        self.logger.debug("Resetting stepper tracked position from %s to 0", self.position)
         self.position = 0
         self.logger.info("Stepper motor homed to position 0")
 
@@ -532,18 +613,68 @@ class StepperMotor(Motor):
         speed: Optional[float] = None,
         step_delay: Optional[float] = None,
     ) -> None:
+        """
+        Execute a low-level stepper move.
+
+        Parameters
+        ----------
+        direction : int
+            GPIO direction value written to ``dir_pin``.
+        rotations : float
+            Number of shaft rotations to convert into step pulses.
+        speed : float, optional
+            Rotational speed in revolutions per second. When positive, this is
+            used to derive ``step_delay``.
+        step_delay : float, optional
+            Explicit half-period delay between GPIO transitions. When omitted,
+            the delay is derived from ``speed`` or falls back to the configured
+            default.
+
+        Raises
+        ------
+        RuntimeError
+            Raised when the stepper has not been connected before motion is
+            requested.
+
+        Notes
+        -----
+        This helper performs the actual GPIO pulse generation used by
+        :meth:`rotate_cw` and :meth:`rotate_ccw`.
+
+        Examples
+        --------
+        >>> motor = StepperMotor(register_cleanup=False)
+        >>> motor.connected = True
+        >>> motor.position = 0
+        """
         if not self.connected:
             raise RuntimeError("Stepper motor is not connected")
         if rotations <= 0:
+            self.logger.debug("Ignoring non-positive stepper rotation request: %s", rotations)
             return
 
         n_steps = int(round(rotations * self.steps_per_rev))
         if n_steps == 0:
+            self.logger.debug(
+                "Rounded stepper rotation request to zero steps rotations=%s steps_per_rev=%s",
+                rotations,
+                self.steps_per_rev,
+            )
             return
 
         if speed is not None and speed > 0.0:
             step_delay = 1.0 / (2.0 * self.steps_per_rev * speed)
         step_delay = self.step_delay if step_delay is None else step_delay
+        direction_name = "cw" if direction == self.GPIO.HIGH else "ccw"
+        self.logger.debug(
+            "Executing stepper motion direction=%s rotations=%s n_steps=%s speed=%s step_delay=%s start_position=%s",
+            direction_name,
+            rotations,
+            n_steps,
+            speed,
+            step_delay,
+            self.position,
+        )
 
         self.GPIO.output(self.dir_pin, direction)
         for _ in range(n_steps):
@@ -556,3 +687,9 @@ class StepperMotor(Motor):
             self.position += n_steps
         else:
             self.position = max(0, self.position - n_steps)
+        self.logger.debug(
+            "Completed stepper motion direction=%s end_position=%s end_rotations=%s",
+            direction_name,
+            self.position,
+            self.position / self.steps_per_rev,
+        )
