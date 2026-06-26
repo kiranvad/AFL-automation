@@ -73,6 +73,7 @@ roboctl = "AFL.automation.cli:main"
 labjack = ["labjack-ljm"]
 piplates = ["piplates"]
 rpi-gpio = ["RPi.GPIO"]
+adafruit = ["adafruit-circuitpython-servokit"]
 serial = ["pyserial"]
 seabreeze = ["seabreeze"]
 opentrons = ["opentrons"]
@@ -83,6 +84,7 @@ ml = ["tensorflow", "gpflow"]
 geometry = ["alphashape", "shapely"]
 neutron-scattering = ["epics", "sans", "mantid"]
 remote-access = ["paramiko"]
+xarm = ["xarm-python-sdk"]
 docs = [
   "sphinx>7.1.0,<9",
   "sphinx-rtd-theme>=2.0.0",

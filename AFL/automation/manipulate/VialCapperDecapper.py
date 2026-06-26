@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+import lazy_loader as lazy
 
-from AFL.automation.APIServer.Client import Client
 from AFL.automation.APIServer.Driver import Driver
-from AFL.automation.shared.motors import ServoMotor, StepperMotor
+
+if TYPE_CHECKING:
+    from AFL.automation.APIServer.Client import Client
+    from AFL.automation.shared.motors import ServoMotor, StepperMotor
 
 
 class VialCapperDecapper(Driver):
@@ -22,11 +25,11 @@ class VialCapperDecapper(Driver):
 
     Parameters
     ----------
-    servo_motor : ServoMotor, optional
+    servo_motor : ServoMotor
         Pre-configured servo helper used to grip and release the cap.
-    stepper_motor : StepperMotor, optional
+    stepper_motor : StepperMotor
         Pre-configured stepper helper used to rotate the cap.
-    xarm_client : Client, optional
+    xarm_client : Client
         AFL client connected to a running xArm server. The xArm is expected to
         support queued ``move`` and ``move_axis`` commands.
     overrides : dict, optional
@@ -109,23 +112,28 @@ class VialCapperDecapper(Driver):
 
     Examples
     --------
-    Create a driver with default helpers and attach an xArm client later.
+    Create a driver with injected hardware helpers and an xArm client.
 
-    >>> driver = VialCapperDecapper(overrides={
-    ...     "vial_spec": {
-    ...         "thread_pitch_mm_per_turn": 1.5,
-    ...         "thread_turns": 1.25,
-    ...         "rotation_segment_turns": 0.25,
-    ...     }
-    ... })
+    >>> driver = VialCapperDecapper(
+    ...     servo_motor=servo,
+    ...     stepper_motor=stepper,
+    ...     xarm_client=client,
+    ...     overrides={
+    ...         "vial_spec": {
+    ...             "thread_pitch_mm_per_turn": 1.5,
+    ...             "thread_turns": 1.25,
+    ...             "rotation_segment_turns": 0.25,
+    ...         }
+    ...     },
+    ... )
     Run a decap sequence using the configured vial specification.
 
     >>> driver.decap(vial_location="capper_nest")
     """
 
     defaults = {
-        "servo": dict(ServoMotor.DEFAULTS),
-        "stepper": dict(StepperMotor.DEFAULTS),
+        "servo": {},
+        "stepper": {},
         "grip_map": {},
         "vial_spec": {
             "vial_diameter_mm": None,
@@ -152,9 +160,9 @@ class VialCapperDecapper(Driver):
 
     def __init__(
         self,
-        servo_motor: Optional[ServoMotor] = None,
-        stepper_motor: Optional[StepperMotor] = None,
-        xarm_client: Optional[Client] = None,
+        servo_motor: ServoMotor,
+        stepper_motor: StepperMotor,
+        xarm_client: Client,
         overrides: Optional[Dict[str, Any]] = None,
         name: str = "VialCapperDecapper",
     ) -> None:
@@ -163,11 +171,11 @@ class VialCapperDecapper(Driver):
 
         Parameters
         ----------
-        servo_motor : ServoMotor, optional
+        servo_motor : ServoMotor
             Pre-configured servo helper used to grip and release caps.
-        stepper_motor : StepperMotor, optional
+        stepper_motor : StepperMotor
             Pre-configured stepper helper used to rotate caps.
-        xarm_client : Client, optional
+        xarm_client : Client
             AFL client connected to a running xArm server.
         overrides : dict, optional
             Driver configuration overrides merged with :attr:`defaults`.
@@ -176,17 +184,41 @@ class VialCapperDecapper(Driver):
 
         Examples
         --------
-        >>> driver = VialCapperDecapper()
+        >>> driver = VialCapperDecapper(
+        ...     servo_motor=servo,
+        ...     stepper_motor=stepper,
+        ...     xarm_client=client,
+        ... )
         >>> driver.connected
         False
         """
         self._app = None
         self._data = None
-        Driver.__init__(self, name=name, defaults=self.gather_defaults(), overrides=overrides)
+        ServoMotor = lazy.load("AFL.automation.shared.motors.ServoMotor", require="AFL-automation[adafruit]")
+        StepperMotor = lazy.load("AFL.automation.shared.motors.StepperMotor", require="AFL-automation[rpi-gpio]")
+        Client = lazy.load("AFL.automation.APIServer.Client", require="AFL-automation[xarm]")
+
+        defaults = self.gather_defaults()
+        defaults["servo"] = dict(ServoMotor.DEFAULTS)
+        defaults["stepper"] = dict(StepperMotor.DEFAULTS)
+        Driver.__init__(self, name=name, defaults=defaults, overrides=overrides)
+
+        if not isinstance(servo_motor, ServoMotor):
+            raise TypeError(
+                f"servo_motor must be an instance of {ServoMotor.__module__}.{ServoMotor.__name__}"
+            )
+        if not isinstance(stepper_motor, StepperMotor):
+            raise TypeError(
+                f"stepper_motor must be an instance of {StepperMotor.__module__}.{StepperMotor.__name__}"
+            )
+        if not isinstance(xarm_client, Client):
+            raise TypeError(
+                f"xarm_client must be an instance of {Client.__module__}.{Client.__name__}"
+            )
 
         self.logger.setLevel(self.config["log_level"])
-        self.servo = servo_motor or ServoMotor(**self.config["servo"])
-        self.stepper = stepper_motor or StepperMotor(**self.config["stepper"])
+        self.servo = servo_motor
+        self.stepper = stepper_motor
         self.xarm_client = xarm_client
 
         self.connected = False
