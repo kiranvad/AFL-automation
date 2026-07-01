@@ -133,6 +133,125 @@ def test_execute_preparation_activates_reservation_after_stock_tip_is_used():
     assert driver.config["reserved_stock_tips"] == ["1A1"]
 
 
+def test_execute_preparation_selects_mount_compatible_stock_tip():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "Water", "masses": {"H2O": "20 g"}, "location": "1A1", "tip": ["1A1", "2A1"]},
+    ]
+    driver.process_stocks()
+    balanced_target = SimpleNamespace(
+        protocol=[SimpleNamespace(source="1A1", volume=10.0, tip_location=["1A1", "2A1"])]
+    )
+
+    success = driver.execute_preparation({}, balanced_target, "5A1")
+
+    assert success is True
+    assert driver.transfer_calls[0]["kwargs"]["tip_location"] == "2A1"
+    assert driver.config["stock_tip_reservations"] == {"Water": ["2A1"]}
+    assert driver.config["reserved_stock_tips"] == ["2A1"]
+
+
+def test_select_stock_tip_location_error_reports_selected_pipette_and_reasons():
+    driver = StubOT2Prepare()
+    driver.config["stock_tip_locations"] = {"Water": ["1A1"]}
+
+    with pytest.raises(ValueError, match="pipette 'p20_single' on right mount for 10.0 uL transfer"):
+        driver._select_stock_tip_location("Water", 10.0)
+
+    with pytest.raises(ValueError, match="1A1: does not match right mount"):
+        driver._select_stock_tip_location("Water", 10.0)
+
+
+def test_select_stock_tip_location_error_reports_unavailable_compatible_tip():
+    driver = StubOT2Prepare()
+    driver.config["stock_tip_locations"] = {"Water": ["2A1"]}
+    driver.config["available_tips"]["right"] = []
+
+    with pytest.raises(ValueError, match="pipette 'p20_single' on right mount for 10.0 uL transfer"):
+        driver._select_stock_tip_location("Water", 10.0)
+
+    with pytest.raises(ValueError, match="2A1: Requested tip location 2A1 is not available"):
+        driver._select_stock_tip_location("Water", 10.0)
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_executes_direct_stock_protocol():
+    driver = StubOT2Prepare()
+    driver.config["loaded_labware"]["1"] = (
+        "tiprack-left",
+        "opentrons_96_tiprack_300ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["available_tips"]["left"] = [("tiprack-left", "A1"), ("tiprack-left", "A2")]
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1"), ("tiprack-right", "A2")]
+    driver.config["stocks"] = [
+        {
+            "name": "Water",
+            "masses": {"H2O": "20 g"},
+            "location": "1A1",
+            "tip": ["1A1", "2A1"],
+        },
+        {
+            "name": "Salt",
+            "masses": {"H2O": "20 g"},
+            "location": "1A2",
+            "tip": ["1A2", "2A2"],
+        },
+    ]
+    driver.process_stocks()
+
+    result, destination = driver.prepare(
+        {
+            "name": "stock_mix_sample",
+            "location": "5A1",
+            "stock_volume_fractions": {"Water": 0.2, "Salt": 0.8},
+            "total_volume": "50 ul",
+        },
+        dest="5A1",
+    )
+
+    assert destination == "5A1"
+    assert len(driver.transfer_calls) == 2
+    assert driver.transfer_calls[0]["source"] == "1A1"
+    assert driver.transfer_calls[0]["requested_volume_ul"] == pytest.approx(10.0)
+    assert driver.transfer_calls[0]["kwargs"]["tip_location"] == "2A1"
+    assert driver.transfer_calls[1]["source"] == "1A2"
+    assert driver.transfer_calls[1]["requested_volume_ul"] == pytest.approx(40.0)
+    assert driver.transfer_calls[1]["kwargs"]["tip_location"] == "1A2"
+    assert driver.config["stock_tip_reservations"] == {"Water": ["2A1"], "Salt": ["1A2"]}
+    assert driver.config["reserved_stock_tips"] == ["2A1", "1A2"]
+    assert driver.config["occupied_sample_locations"] == ["5A1"]
+    assert result["stock_volume_fractions"] == {"Water": 0.2, "Salt": 0.8}
+    assert result["destination"] == "5A1"
+    assert result["total_volume"].endswith(" ul")
+    assert float(result["total_volume"].split()[0]) == pytest.approx(50.0)
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_requires_known_stock():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "Water", "masses": {"H2O": "20 g"}, "location": "1A1", "tip": ["1A1", "2A1"]},
+    ]
+    driver.process_stocks()
+
+    with pytest.raises(ValueError, match="Stock 'Missing' not found for stock_volume_fractions target"):
+        driver.prepare(
+            {
+                "name": "stock_mix_sample",
+                "location": "5A1",
+                "stock_volume_fractions": {"Missing": 1.0},
+                "total_volume": "100 ul",
+            },
+            dest="5A1",
+        )
+
+
 def test_execute_preparation_marks_destination_occupied():
     driver = StubOT2Prepare()
     balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=50.0)])

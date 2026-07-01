@@ -240,6 +240,43 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert transfer_result["dest"] == "1A2"
 
 
+def test_drop_tip_moves_to_trash_before_drop(monkeypatch):
+    driver = _configured_driver()
+
+    def fake_get(url, headers=None):
+        assert url == f"{driver.base_url}/runs/{driver.run_id}"
+        return _FakeResponse(
+            {
+                "data": {
+                    "labware": [
+                        {
+                            "id": "fixed-trash-id",
+                            "definition": {
+                                "metadata": {"displayCategory": "trash"},
+                                "parameters": {"loadName": "opentrons_1_trash_1100ml_fixed"},
+                                "wells": {"A1": {}},
+                            },
+                        }
+                    ]
+                }
+            },
+            status_code=200,
+        )
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.get", fake_get)
+
+    driver._drop_tip_to_trash("left-id")
+
+    command_names = [name for name, _ in driver.executed_commands]
+    assert command_names == ["moveToWell", "dropTipInPlace"]
+
+    move_to_well = driver.executed_commands[0][1]
+    assert move_to_well["pipetteId"] == "left-id"
+    assert move_to_well["labwareId"] == "fixed-trash-id"
+    assert move_to_well["wellName"] == "A1"
+    assert move_to_well["wellLocation"]["origin"] == "top"
+
+
 def test_transfer_rejects_drop_tip_and_return_tip_together():
     driver = _configured_driver()
 
@@ -276,6 +313,84 @@ def test_transfer_with_tip_location_reuses_current_tip_when_already_attached():
 
     command_names = [name for name, _ in driver.executed_commands]
     assert "pickUpTip" not in command_names
+
+
+def test_transfer_with_tip_location_candidates_uses_first_available_for_mount():
+    driver = _configured_driver()
+
+    transfer_result = driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        tip_location=["1A3", "1A2"],
+    )
+
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+    assert pick_up["labwareId"] == "tiprack-left"
+    assert pick_up["wellName"] == "A2"
+    assert transfer_result["requested_tip"]["location"] == "1A2"
+    assert transfer_result["options"]["tip_location"] == "1A2"
+
+
+def test_transfer_with_tip_location_wrong_mount_raises():
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info("right", "right-id", min_volume=1, max_volume=100)
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+    ]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    with pytest.raises(ValueError, match="Requested tip location 1A1 does not match right mount"):
+        driver.transfer(
+            "1A1",
+            "1A2",
+            5,
+            drop_tip=False,
+            tip_location="1A1",
+        )
+
+
+def test_transfer_with_tip_location_candidates_wrong_mount_raises():
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info("right", "right-id", min_volume=1, max_volume=100)
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+    ]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    with pytest.raises(ValueError, match="Requested tip location 1A1 does not match right mount"):
+        driver.transfer(
+            "1A1",
+            "1A2",
+            5,
+            drop_tip=False,
+            tip_location=["1A1", "2A2"],
+        )
 
 
 def test_transfer_without_tip_location_skips_stock_reserved_tips():
@@ -320,6 +435,69 @@ def test_transfer_return_tip_restores_tip_to_available_trace():
     ]
 
 
+def test_reserved_tip_return_can_be_reused_explicitly_but_skipped_for_general_transfer():
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info("right", "right-id", min_volume=1, max_volume=20)
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A2")]
+    driver.config["reserved_stock_tips"] = ["2A1"]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    driver.has_tip = True
+    driver.last_pipette = "right"
+    driver.current_tip = {
+        "mount": "right",
+        "labware_id": "tiprack-right",
+        "well_name": "A1",
+        "slot": "2",
+        "location": "2A1",
+    }
+
+    # Simulate returning a stock-reserved tip even if a caller passes an
+    # inconsistent mount hint. The tip must be restored to its origin mount.
+    driver._return_tip_to_origin("right-id", mount="left")
+
+    assert driver.config["available_tips"]["right"] == [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+    ]
+    assert ("tiprack-right", "A1") not in driver.config["available_tips"]["left"]
+
+    driver.executed_commands.clear()
+    driver.transfer("1A1", "1A2", 5, drop_tip=False, return_tip=True, tip_location="2A1")
+
+    stock_pick_up = next(
+        params
+        for command, params in driver.executed_commands
+        if command == "pickUpTip" and params.get("labwareId") == "tiprack-right"
+    )
+    assert stock_pick_up["wellName"] == "A1"
+    assert driver.config["available_tips"]["right"] == [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+    ]
+
+    driver.executed_commands.clear()
+    driver.transfer("1A1", "1A2", 5, drop_tip=False, return_tip=True)
+
+    general_pick_up = next(
+        params
+        for command, params in driver.executed_commands
+        if command == "pickUpTip" and params.get("labwareId") == "tiprack-right"
+    )
+    assert general_pick_up["wellName"] == "A2"
+
+
 def test_transfer_tip_rack_offset_applies_to_pickup_and_return():
     driver = _configured_driver()
     offset = {"x": 1.5, "y": -0.5, "z": -2.0}
@@ -344,6 +522,85 @@ def test_transfer_tip_rack_offset_applies_to_pickup_and_return():
     assert pick_up["wellLocation"]["offset"] == offset
     assert move_to_well["wellLocation"]["offset"] == offset
     assert transfer_result["options"]["tip_rack_offset"] == offset
+
+
+def test_transfer_tip_rack_offset_can_be_configured_per_mount_left():
+    driver = _configured_driver()
+    left_offset = {"x": 1.5, "y": -0.5, "z": -2.0}
+    driver.config["tip_rack_offset"] = {
+        "left": left_offset,
+        "right": {"x": 0.0, "y": 0.0, "z": -0.25},
+    }
+
+    transfer_result = driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        return_tip=True,
+        tip_location="1A2",
+    )
+
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+    move_to_well = next(
+        params
+        for command, params in driver.executed_commands
+        if command == "moveToWell" and params.get("labwareId") == "tiprack-left"
+    )
+
+    assert pick_up["wellLocation"]["offset"] == left_offset
+    assert move_to_well["wellLocation"]["offset"] == left_offset
+    assert transfer_result["options"]["tip_rack_offset"] == left_offset
+
+
+def test_transfer_tip_rack_offset_can_be_configured_per_mount_right():
+    driver = _configured_driver()
+    right_offset = {"x": -0.75, "y": 0.25, "z": -1.25}
+    driver.config["tip_rack_offset"] = {
+        "left": {"x": 0.0, "y": 0.0, "z": -0.5},
+        "right": right_offset,
+    }
+    driver.hardware_pipettes["right"] = _pipette_info("right", "right-id", min_volume=1, max_volume=20)
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+    ]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    transfer_result = driver.transfer(
+        "1A1",
+        "1A2",
+        5,
+        drop_tip=False,
+        return_tip=True,
+        tip_location="2A2",
+    )
+
+    pick_up = next(
+        params
+        for command, params in driver.executed_commands
+        if command == "pickUpTip" and params.get("labwareId") == "tiprack-right"
+    )
+    move_to_well = next(
+        params
+        for command, params in driver.executed_commands
+        if command == "moveToWell" and params.get("labwareId") == "tiprack-right"
+    )
+
+    assert pick_up["wellLocation"]["offset"] == right_offset
+    assert move_to_well["wellLocation"]["offset"] == right_offset
+    assert transfer_result["options"]["tip_rack_offset"] == right_offset
 
 
 def test_get_pipette_raises_when_no_loaded_pipettes_exist():

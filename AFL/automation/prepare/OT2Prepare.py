@@ -1,1105 +1,476 @@
+import copy
 import warnings
+from typing import Dict, Optional
 
-from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
-from AFL.automation.prepare.PrepareDriver import PrepareDriver
+from AFL.automation.mixcalc.MassBalance import MassBalance
+from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
+from AFL.automation.mixcalc.Solution import Solution
+from AFL.automation.prepare.PipetteAction import PipetteAction
+from AFL.automation.shared.PersistentConfig import PersistentConfig
+from AFL.automation.shared.units import enforce_units
 from AFL.automation.shared.utilities import listify
 
 
-class OT2Prepare(OT2HTTPDriver, PrepareDriver):
-    """Preparation-oriented OT-2 driver.
+class _PreparedProtocolTarget:
+    """Lightweight target wrapper for direct prepare protocols."""
 
-    This class combines :class:`OT2HTTPDriver` transport primitives with the
-    higher-level preparation workflow implemented by :class:`PrepareDriver`.
-    It adds stock-aware tip reservation, destination occupancy tracking, and
-    execution helpers for preparation plans.
+    def __init__(self, name, location=None, total_volume=None, protocol=None, payload=None):
+        self.name = name
+        self.location = location
+        self.volume = total_volume
+        self.protocol = list(protocol or [])
+        self._payload = copy.deepcopy(payload) if payload is not None else {}
 
-    Parameters
-    ----------
-    overrides : dict, optional
-        Configuration overrides merged into the inherited defaults.
+    def to_dict(self):
+        return copy.deepcopy(self._payload)
 
-    Examples
-    --------
-    >>> driver = OT2Prepare({"robot_ip": "192.168.1.50"})
-    >>> driver.add_prep_targets(["4A1", "4A2"])
-    >>> driver.resolve_destination(None)
-    '4A1'
+
+class PrepareDriver(MassBalanceDriver):
+    """Base class for prepare drivers.
+
+    Subclasses provide transport/backend-specific execution while this class
+    handles shared target conditioning and mass-balance feasibility/solve flow.
     """
+
     defaults = {
-        "prep_targets": [],
-        "prepare_volume": "900 ul",
-        "catch_volume": "900 ul",
-        "deck": {},
         "stocks": [],
-        "stock_mix_order": [],
         "fixed_compositions": {},
-        "stock_locations": {},  # Maps stock names to deck positions: {'stockH2O': '3A2'}
-        "stock_transfer_params": {},  # Per-stock transfer parameters: {'stockH2O': {'mix_after': True}}
-        "catch_protocol": {},  # PipetteAction-formatted dict for catch transfer parameters
+        "composition_format": "masses",
+        "enable_multistep_dilution": False,
+        "multistep_max_steps": 2,
+        "multistep_diluent_policy": "primary_solvent",
     }
 
-    def __init__(self, overrides=None):
-        """Initialize the preparation driver.
+    def __init__(self, driver_name: str, overrides=None):
+        MassBalanceDriver.__init__(self, overrides=overrides)
 
-        Parameters
-        ----------
-        overrides : dict, optional
-            Configuration values applied on top of the inherited defaults.
+        self.name = driver_name
+        self.filepath = self.path / (self.name + ".config.json")
+        self.config = PersistentConfig(
+            path=self.filepath,
+            defaults=self.gather_defaults(),
+            overrides=overrides,
+            max_history=100,
+            max_history_size_mb=50,
+            write_debounce_seconds=0.5,
+            compact_json=True,
+        )
 
-        Examples
-        --------
-        >>> driver = OT2Prepare({"prepare_volume": "500 ul"})
-        >>> driver.last_target_location is None
-        True
-        """
-        OT2HTTPDriver.__init__(self, overrides=overrides)
-        PrepareDriver.__init__(self, driver_name="OT2Prepare", overrides=overrides)
-        self.last_target_location = None
-        self.useful_links["View Deck"] = "/visualize_deck"
+        self.stocks = []
+        self.targets = []
+        self.process_stocks()
 
     def status(self):
-        """Return combined preparation and robot status lines.
-
-        Returns
-        -------
-        list of str
-            Human-readable status lines from both parent driver layers.
-
-        Examples
-        --------
-        >>> isinstance(driver.status(), list)
-        True
-        """
-        return PrepareDriver.status(self) + OT2HTTPDriver.status(self)
-
-    def _status_lines(self):
-        """Build preparation-specific status lines.
-
-        Returns
-        -------
-        list of str
-            Summary lines describing configured stocks, reserved stock tips,
-            occupied sample locations, and queued preparation targets.
-
-        Examples
-        --------
-        >>> lines = driver._status_lines()
-        >>> isinstance(lines, list)
-        True
-        """
         status = []
-        status.append(f"Stocks: {len(self.stocks)} configured")
-        status.append(f"Stock locations: {self.config['stock_locations']}")
-        status.append(
-            f"Stock-reserved tips: {len(self.config.get('reserved_stock_tips', []))}"
-        )
-        status.append(
-            f"Occupied sample locations: {len(self.config.get('occupied_sample_locations', []))}"
-        )
-        status.append(f"{len(self.config['prep_targets'])} preparation targets available")
+        status.append(f"AFL Server Stocks: {self.config['stocks']}")
+        status.extend(self._status_lines())
         return status
 
-    def _normalize_locations(self, locations):
-        """Normalize and deduplicate deck locations.
+    def _status_lines(self) -> list[str]:
+        """Subclass hook for additional status lines."""
+        return []
 
-        Parameters
-        ----------
-        locations : iterable of str
-            Deck locations such as ``"4A1"`` or ``"6B3"``.
+    def is_feasible(
+        self,
+        targets: dict | list[dict],
+        enable_multistep_dilution: bool | None = None,
+    ) -> list[dict | None]:
+        targets_to_check = listify(targets)
+        self.process_stocks()
+        minimum_volume = self.config.get("minimum_volume", "100 ul")
+        if enable_multistep_dilution is None:
+            enable_multistep_dilution = bool(self.config.get("enable_multistep_dilution", False))
 
-        Returns
-        -------
-        list of str
-            Uppercase normalized locations in first-seen order.
+        results: list[dict | None] = []
+        for target in targets_to_check:
+            try:
+                mb = MassBalance(minimum_volume=minimum_volume)
+                for stock in self.stocks:
+                    mb.stocks.append(stock)
 
-        Examples
-        --------
-        >>> driver._normalize_locations(["4a1", "4A1", "4b1"])
-        ['4A1', '4B1']
-        """
-        normalize_location = getattr(self, "_normalize_deck_location", None)
-        normalized = []
-        for location in locations:
-            if normalize_location is not None:
-                normalized_location = normalize_location(location)
-            else:
-                if location is None:
-                    normalized_location = None
-                elif not isinstance(location, str):
-                    raise TypeError(
-                        f"Deck location must be a string, got {type(location).__name__}"
-                    )
+                target_with_fixed = self.apply_fixed_comps(target.copy())
+                target_solution = Solution(**target_with_fixed)
+                mb.targets.append(target_solution)
+                mb.balance(
+                    tol=self.config.get("tol", 1e-3),
+                    enable_multistep_dilution=bool(enable_multistep_dilution),
+                    multistep_max_steps=int(self.config.get("multistep_max_steps", 2)),
+                    multistep_diluent_policy=str(self.config.get("multistep_diluent_policy", "primary_solvent")),
+                )
+
+                if (
+                    mb.balanced
+                    and len(mb.balanced) > 0
+                    and mb.balanced[0].get("balanced_target") is not None
+                ):
+                    results.append(mb.balanced[0]["balanced_target"].to_dict())
                 else:
-                    normalized_location = location.strip().upper()
-            if normalized_location not in normalized:
-                normalized.append(normalized_location)
-        return normalized
+                    results.append(None)
+            except Exception as e:
+                warnings.warn(
+                    f"Exception during feasibility check for target "
+                    f"{target.get('name', 'Unnamed')}: {str(e)}",
+                    stacklevel=2,
+                )
+                results.append(None)
+        return results
 
-    def _sync_stock_tip_tracking(self):
-        """Rebuild stock-tip configuration and active reservations.
+    def apply_fixed_comps(self, target: dict) -> dict:
+        result = target.copy()
+        fixed_comps = self.config.get("fixed_compositions", {})
+        if not fixed_comps:
+            return result
 
-        Notes
-        -----
-        This method inspects configured stock objects for ``tip_location`` or
-        legacy ``tip`` attributes and synchronizes the persistent reservation
-        state stored in the driver config.
+        for prop_type in ["masses", "volumes", "concentrations", "mass_fractions"]:
+            if prop_type not in result:
+                result[prop_type] = {}
+            if prop_type in fixed_comps:
+                for comp_name, comp_value in fixed_comps[prop_type].items():
+                    if comp_name not in result[prop_type]:
+                        result[prop_type][comp_name] = comp_value
 
-        Examples
-        --------
-        >>> driver._sync_stock_tip_tracking()
-        >>> isinstance(driver.config.get("stock_tip_locations", {}), dict)
-        True
+        for prop in ["total_mass", "total_volume", "name", "location"]:
+            if prop in fixed_comps and prop not in result:
+                result[prop] = fixed_comps[prop]
+
+        if "solutes" in fixed_comps:
+            if "solutes" not in result:
+                result["solutes"] = fixed_comps["solutes"].copy()
+            else:
+                for solute in fixed_comps["solutes"]:
+                    if solute not in result["solutes"]:
+                        result["solutes"].append(solute)
+
+        return result
+
+    def before_balance(self, target: dict) -> None:
+        """Subclass hook to perform backend-specific checks before solving."""
+
+    def resolve_destination(self, dest: Optional[str]) -> str:
+        """Return destination identifier for this backend."""
+        raise NotImplementedError("PrepareDriver subclasses must implement resolve_destination().")
+
+    def execute_preparation(self, target: dict, balanced_target: Solution, destination: str) -> bool:
+        """Execute backend-specific prepare actions.
+
+        Returns False for handled, non-fatal failures where caller should return
+        (None, None). Raise for hard failures.
         """
-        stock_tip_locations = {}
-        for stock in getattr(self, "stocks", []):
-            tip_location = getattr(stock, "tip_location", None) or getattr(stock, "tip", None)
-            if tip_location is None:
+        raise NotImplementedError("PrepareDriver subclasses must implement execute_preparation().")
+
+    def execute_preparation_plan(
+        self,
+        target: dict,
+        balanced_target: Solution,
+        destination: str,
+        procedure_plan: dict,
+        intermediate_destinations: list[str],
+    ) -> bool:
+        if procedure_plan.get("required_intermediate_targets", 0) > 0:
+            raise NotImplementedError(
+                "This prepare backend does not implement multi-step execution."
+            )
+        return self.execute_preparation(target, balanced_target, destination)
+
+    def on_prepare_exception(self, destination: str, dest_was_none: bool) -> None:
+        """Subclass hook to rollback destination bookkeeping on exceptions."""
+
+    def build_prepare_result(self, feasible_result: dict, balanced_target: Solution) -> dict:
+        """Build return payload for prepare()."""
+        return feasible_result
+
+    def _uses_stock_volume_fractions(self, target: dict) -> bool:
+        return bool(target.get("stock_volume_fractions"))
+
+    def _build_stock_volume_fraction_prepare_target(self, target: dict):
+        self.process_stocks()
+
+        stock_volume_fractions = target.get("stock_volume_fractions") or {}
+        if not stock_volume_fractions:
+            raise ValueError("Target stock_volume_fractions must not be empty.")
+
+        if target.get("total_volume") is None:
+            raise ValueError("Target with stock_volume_fractions requires total_volume.")
+
+        total_volume = enforce_units(target["total_volume"], "volume")
+        stock_by_name = {stock.name: stock for stock in self.stocks}
+        available_stock_names = sorted(stock_by_name.keys())
+
+        normalized_fractions = {}
+        total_fraction = 0.0
+        protocol = []
+        for stock_name, fraction in stock_volume_fractions.items():
+            try:
+                fraction = float(fraction)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Stock volume fraction for '{stock_name}' must be numeric, got {fraction!r}"
+                ) from exc
+            if fraction < 0:
+                raise ValueError(
+                    f"Stock volume fraction for '{stock_name}' must be nonnegative, got {fraction}"
+                )
+            normalized_fractions[stock_name] = fraction
+            total_fraction += fraction
+
+            if fraction == 0:
                 continue
-            stock_tip_locations[stock.name] = self._normalize_locations(listify(tip_location))
 
-        existing_reservations = self.config.get("stock_tip_reservations", {})
-        normalized_reservations = {}
-        for stock_name, tip_locations in existing_reservations.items():
-            configured_tips = stock_tip_locations.get(stock_name, [])
-            if not configured_tips:
-                continue
-            active = [
-                location
-                for location in self._normalize_locations(listify(tip_locations))
-                if location in configured_tips
-            ]
-            if active:
-                normalized_reservations[stock_name] = active
+            stock = stock_by_name.get(stock_name)
+            if stock is None:
+                raise ValueError(
+                    f"Stock '{stock_name}' not found for stock_volume_fractions target. "
+                    f"Available stocks: {available_stock_names}"
+                )
+            if getattr(stock, "location", None) is None:
+                raise ValueError(f"Stock '{stock_name}' has no deck location configured.")
 
-        active_reserved = []
-        for tip_locations in normalized_reservations.values():
-            active_reserved.extend(tip_locations)
+            transfer_volume_ul = float((total_volume * fraction).to("ul").magnitude)
+            protocol.append(
+                PipetteAction(
+                    source=stock.location,
+                    dest=target.get("location"),
+                    volume=transfer_volume_ul,
+                    tip_location=getattr(stock, "tip_location", None) or getattr(stock, "tip", None),
+                )
+            )
 
-        self.config["stock_tip_locations"] = stock_tip_locations
-        self.config["stock_tip_reservations"] = normalized_reservations
-        self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
+        if abs(total_fraction - 1.0) > 1e-6:
+            raise ValueError(
+                f"stock_volume_fractions must sum to 1.0, got {total_fraction}"
+            )
 
-    def _ordered_stock_tip_candidates(self, stock_name, step_tip_location=None):
-        """Return prioritized tip candidates for a stock transfer.
+        payload = copy.deepcopy(target)
+        payload["stock_volume_fractions"] = normalized_fractions
+        payload["total_volume"] = str(total_volume)
+        prepared_target = _PreparedProtocolTarget(
+            name=str(target.get("name", "Unnamed target")) + "-prepared",
+            location=target.get("location"),
+            total_volume=total_volume,
+            protocol=protocol,
+            payload=payload,
+        )
+        feasible_result = copy.deepcopy(payload)
+        feasible_result["prepare_mode"] = "stock_volume_fractions"
+        return feasible_result, prepared_target, {}, None
 
-        Parameters
-        ----------
-        stock_name : str
-            Stock identifier used in the preparation configuration.
-        step_tip_location : str or sequence of str, optional
-            Explicit tip location override from a protocol step.
-
-        Returns
-        -------
-        list of str
-            Normalized tip locations with active reservations ordered before
-            configured fallback candidates.
-
-        Examples
-        --------
-        >>> driver._ordered_stock_tip_candidates("stockH2O")
-        ['6A1']
-        """
-        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
-        if step_tip_location is None:
-            candidates = list(configured)
-        else:
-            candidates = self._normalize_locations(listify(step_tip_location))
-
-        active = self.config.get("stock_tip_reservations", {}).get(stock_name, [])
-        ordered = []
-        for normalized in self._normalize_locations(list(active) + list(candidates)):
-            if normalized not in ordered:
-                ordered.append(normalized)
-        return ordered
-
-    def _select_stock_tip_location(self, stock_name, volume_ul, step_tip_location=None):
-        """Choose an available stock-reserved tip location.
-
-        Parameters
-        ----------
-        stock_name : str
-            Stock identifier.
-        volume_ul : float
-            Transfer volume used to determine the pipette mount.
-        step_tip_location : str or sequence of str, optional
-            Explicit tip location override from the planned transfer step.
-
-        Returns
-        -------
-        str or None
-            Selected normalized tip location, or ``None`` when no stock tip is
-            configured.
-
-        Raises
-        ------
-        ValueError
-            If configured stock tips exist but none are currently available for
-            the required mount.
-
-        Examples
-        --------
-        >>> driver._select_stock_tip_location("stockH2O", 50)
-        '6A1'
-        """
-        candidates = self._ordered_stock_tip_candidates(stock_name, step_tip_location)
-        if not candidates:
+    def _ensure_prepare_metadata(self) -> dict | None:
+        if self.data is None:
             return None
 
-        pipette_mount = self.get_pipette(float(volume_ul))["mount"]
-        match_tip_location = getattr(self, "_tip_location_matches_mount", None)
-        resolve_tip_location = getattr(self, "_resolve_tip_location", None)
-        compatible = []
-        for location in candidates:
-            if match_tip_location is not None:
-                try:
-                    matches_mount = match_tip_location(pipette_mount, location)
-                except ValueError:
-                    continue
-                if not matches_mount:
-                    continue
-            compatible.append(location)
-            if resolve_tip_location is None:
-                return location
-            try:
-                resolve_tip_location(pipette_mount, location)
-                return location
-            except ValueError:
-                continue
+        prepare_meta = self.data.get("prepare")
+        if not isinstance(prepare_meta, dict):
+            prepare_meta = {}
+            self.data["prepare"] = prepare_meta
+        prepare_meta.setdefault("executed_transfers", [])
+        return prepare_meta
 
-        if compatible:
-            raise ValueError(
-                f"No configured tip locations for stock '{stock_name}' are currently available "
-                f"on {pipette_mount} mount: {', '.join(compatible)}"
-            )
-        raise ValueError(
-            f"No configured tip locations for stock '{stock_name}' match the {pipette_mount} mount: "
-            f"{', '.join(candidates)}"
-        )
+    def _update_prepare_metadata(self, **updates) -> dict | None:
+        prepare_meta = self._ensure_prepare_metadata()
+        if prepare_meta is None:
+            return None
+        for key, value in updates.items():
+            prepare_meta[key] = value
+        return prepare_meta
 
-    def _activate_stock_tip_reservation(self, stock_name, tip_location):
-        """Mark a stock tip as actively reserved.
-
-        Parameters
-        ----------
-        stock_name : str
-            Stock identifier.
-        tip_location : str or None
-            Tip location to reserve. ``None`` leaves the reservation state
-            unchanged.
-
-        Examples
-        --------
-        >>> driver._activate_stock_tip_reservation("stockH2O", "6A1")
-        """
-        if stock_name is None or tip_location is None:
+    def _append_prepare_transfer(self, transfer_entry: dict) -> None:
+        prepare_meta = self._ensure_prepare_metadata()
+        if prepare_meta is None:
             return
+        executed = prepare_meta.setdefault("executed_transfers", [])
+        executed.append(copy.deepcopy(transfer_entry))
 
-        tip_location = self._normalize_locations([tip_location])[0]
-        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
-        if tip_location not in configured:
-            return
+    def _serialize_planned_mass_transfers(self, planned_mass_transfers: dict | None) -> dict | None:
+        if planned_mass_transfers is None:
+            return None
 
-        reservations = {
-            name: self._normalize_locations(listify(locations))
-            for name, locations in self.config.get("stock_tip_reservations", {}).items()
-        }
-        for other_stock, locations in reservations.items():
-            if other_stock != stock_name and tip_location in locations:
-                raise ValueError(
-                    f"Tip location {tip_location} is already reserved for stock '{other_stock}' "
-                    f"and cannot also be reserved for stock '{stock_name}'."
-                )
+        serialized = {}
+        for stock, mass in planned_mass_transfers.items():
+            stock_key = stock.name if hasattr(stock, "name") else str(stock)
+            serialized[stock_key] = mass
+        return serialized
 
-        stock_reservations = reservations.get(stock_name, [])
-        if tip_location not in stock_reservations:
-            stock_reservations.append(tip_location)
-        reservations[stock_name] = self._normalize_locations(stock_reservations)
-
-        active_reserved = []
-        for locations in reservations.values():
-            active_reserved.extend(locations)
-
-        self.config["stock_tip_reservations"] = reservations
-        self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
-
-    def _build_stock_transfer_params(self, stock_name, volume_ul, step_tip_location=None):
-        """Build transfer keyword arguments for a stock step.
-
-        Parameters
-        ----------
-        stock_name : str
-            Stock identifier.
-        volume_ul : float
-            Requested transfer volume in microliters.
-        step_tip_location : str or sequence of str, optional
-            Explicit tip location override from the protocol step.
-
-        Returns
-        -------
-        tuple
-            Two-item tuple ``(transfer_params, selected_tip_location)``.
-
-        Examples
-        --------
-        >>> params, tip = driver._build_stock_transfer_params("stockH2O", 100)
-        >>> isinstance(params, dict)
-        True
-        """
-        transfer_params = self.get_transfer_params(stock_name)
-        selected_tip_location = self._select_stock_tip_location(
-            stock_name=stock_name,
-            volume_ul=volume_ul,
-            step_tip_location=step_tip_location,
-        )
-        if selected_tip_location is not None:
-            transfer_params["tip_location"] = selected_tip_location
-        return transfer_params, selected_tip_location
-
-    def _occupied_sample_locations(self):
-        """Return occupied sample destinations as a normalized set.
-
-        Returns
-        -------
-        set of str
-            Occupied destination locations currently tracked in config.
-
-        Examples
-        --------
-        >>> isinstance(driver._occupied_sample_locations(), set)
-        True
-        """
-        return set(self._normalize_locations(self.config.get("occupied_sample_locations", [])))
-
-    def _assert_destination_locations_available(self, destinations):
-        """Validate that destination locations are not already occupied.
-
-        Parameters
-        ----------
-        locations : iterable of str
-            Destination locations to validate.
-
-        Raises
-        ------
-        ValueError
-            If duplicate destinations are requested or any destination is
-            already marked occupied.
-
-        Examples
-        --------
-        >>> driver._assert_destination_locations_available(["4A1", "4A2"])
-        """
-        normalized = self._normalize_locations(listify(destinations))
-        duplicates = sorted({location for location in normalized if normalized.count(location) > 1})
-        if duplicates:
-            raise ValueError(
-                "Preparation requested the same destination location more than once: "
-                + ", ".join(duplicates)
-            )
-
-        occupied = self._occupied_sample_locations()
-        conflicts = [location for location in normalized if location in occupied]
-        if conflicts:
-            raise ValueError(
-                "Destination location(s) already contain a prepared sample: "
-                + ", ".join(conflicts)
-                + ". Clear or change those sample destinations before preparing again."
-            )
-
-    def _mark_sample_locations_occupied(self, locations):
-        """Record destination locations as occupied.
-
-        Parameters
-        ----------
-        locations : iterable of str
-            Locations to add to the occupied-sample tracking list.
-
-        Examples
-        --------
-        >>> driver._mark_sample_locations_occupied(["4A1"])
-        """
-        occupied = self._normalize_locations(self.config.get("occupied_sample_locations", []))
-        for location in self._normalize_locations(listify(locations)):
-            if location not in occupied:
-                occupied.append(location)
-        self.config["occupied_sample_locations"] = occupied
-
-    def clear_sample_locations(self, locations=None):
-        """Clear occupied sample destination tracking.
-
-        Parameters
-        ----------
-        locations : str or sequence of str, optional
-            Specific occupied locations to clear. If omitted, all occupied
-            sample locations are cleared.
-
-        Returns
-        -------
-        list of str
-            Normalized locations that were cleared.
-
-        Examples
-        --------
-        >>> driver.clear_sample_locations(["4A1"])
-        ['4A1']
-        >>> driver.clear_sample_locations()
-        []
-        """
-        occupied = self._occupied_sample_locations()
-        if locations is None:
-            self.config["occupied_sample_locations"] = []
-            self.config._update_history()
-            return []
-
-        to_clear = set(self._normalize_locations(listify(locations)))
-        remaining = [location for location in occupied if location not in to_clear]
-        cleared = [location for location in occupied if location in to_clear]
-        self.config["occupied_sample_locations"] = remaining
-        self.config._update_history()
-        return cleared
-
-    def resolve_destination(self, destination):
-        """Resolve the destination well for a preparation.
-
-        Parameters
-        ----------
-        destination : str or None
-            Explicit destination location. If ``None``, the next queued
-            preparation target is consumed.
-
-        Returns
-        -------
-        str
-            Normalized destination location.
-
-        Raises
-        ------
-        ValueError
-            If no destination is available or the destination is already
-            occupied.
-
-        Examples
-        --------
-        >>> driver.resolve_destination("4A1")
-        '4A1'
-        """
-        if destination is None:
-            if not self.config.get("prep_targets"):
-                raise ValueError("No preparation targets configured. Cannot select a destination target.")
-            prep_targets = list(self.config["prep_targets"])
-            destination = self._normalize_locations([prep_targets[0]])[0]
-            self._assert_destination_locations_available([destination])
-            prep_targets.pop(0)
-            self.config["prep_targets"] = prep_targets
-            return destination
-
-        destination = self._normalize_locations([destination])[0]
-        self._assert_destination_locations_available([destination])
-        return destination
-
-    def _reserve_destinations(self, destination, intermediate_destinations=None):
-        """Reserve final and intermediate destinations for a preparation plan.
-
-        Parameters
-        ----------
-        destination : str
-            Final destination location.
-        intermediate_destinations : sequence of str, optional
-            Intermediate destination locations used by staged plans.
-
-        Returns
-        -------
-        tuple
-            Normalized ``(destination, intermediate_destinations)``.
-
-        Raises
-        ------
-        ValueError
-            If any requested destination is already occupied.
-
-        Examples
-        --------
-        >>> driver._reserve_destinations("4A1", ["5A1"])
-        ('4A1', ['5A1'])
-        """
-        requested_destination = destination
-        requested_intermediate_destinations = list(intermediate_destinations or [])
-        required_intermediate_targets = len(requested_intermediate_destinations)
-        destination, intermediate_destinations, consumed, queue_key = super()._reserve_destinations(
-            dest=requested_destination,
-            required_intermediate_targets=required_intermediate_targets,
-        )
-        all_destinations = list(intermediate_destinations) + [destination]
-        normalized_destinations = self._normalize_locations(all_destinations)
-        normalized_intermediates = normalized_destinations[: len(intermediate_destinations)]
-        normalized_destination = normalized_destinations[-1]
-        try:
-            self._assert_destination_locations_available(normalized_destinations)
-        except Exception:
-            if required_intermediate_targets > 0:
-                self._restore_reserved_destinations(queue_key=queue_key, consumed=consumed)
-            elif requested_destination is None:
-                queue = list(self.config.get("prep_targets", []))
-                self.config["prep_targets"] = [normalized_destination] + queue
-            raise
-        return normalized_destination, normalized_intermediates, consumed, queue_key
-
-    def execute_preparation(self, target, balanced_target, destination):
-        """Execute a simple preparation protocol into one destination.
-
-        Parameters
-        ----------
-        target : object
-            Original target specification from the preparation workflow.
-        balanced_target : object
-            Balanced target object containing a generated ``protocol``.
-        destination : str
-            Destination deck location.
-
-        Returns
-        -------
-        bool
-            ``True`` when all transfers succeed, otherwise ``False``.
-
-        Raises
-        ------
-        ValueError
-            If no protocol is available or a stock location cannot be resolved.
-
-        Examples
-        --------
-        >>> driver.execute_preparation(target, balanced_target, "4A1")
-        True
-        """
-        if not hasattr(balanced_target, "protocol") or not balanced_target.protocol:
-            raise ValueError("No protocol generated for the target solution")
-
-        protocol = self.reorder_protocol(balanced_target.protocol)
-        for step in protocol:
-            source = step.source
-            volume_ul = step.volume
-            if float(volume_ul) <= 0:
-                continue
-            stock_name = self.config.get("deck", {}).get(source)
-            if stock_name is None:
-                raise ValueError(f"No stock name found for deck location: {source}")
-
-            transfer_params, selected_tip_location = self._build_stock_transfer_params(
-                stock_name=stock_name,
-                volume_ul=volume_ul,
-                step_tip_location=getattr(step, "tip_location", None),
-            )
-            try:
-                transfer_result = self.transfer(
-                    source=source,
-                    dest=destination,
-                    volume=volume_ul,
-                    **transfer_params,
-                )
-                self._record_prepare_transfer(
-                    stage_type="single",
-                    source=source,
-                    dest=destination,
-                    requested_volume_ul=float(volume_ul),
-                    source_stock_name=stock_name,
-                    transfer_params=transfer_params,
-                    transfer_result=transfer_result,
-                    planned_transfer={
-                        "source": source,
-                        "dest": destination,
-                        "source_stock_name": stock_name,
-                    },
-                )
-                self._activate_stock_tip_reservation(stock_name, selected_tip_location)
-            except Exception as e:
-                warnings.warn(f"Transfer failed from {source} to {destination}: {str(e)}", stacklevel=2)
-                return False
-
-        self.last_target_location = destination
-        self._mark_sample_locations_occupied([destination])
-        return True
-
-    def _resolve_stage_source(self, source_location, intermediate_map):
-        """Resolve a staged source token to a concrete deck location.
-
-        Parameters
-        ----------
-        source_location : str
-            Source location or ``@intermediate:<id>`` token.
-        intermediate_map : dict
-            Mapping from intermediate identifiers to deck locations.
-
-        Returns
-        -------
-        str
-            Concrete deck location.
-
-        Raises
-        ------
-        ValueError
-            If an intermediate token cannot be resolved.
-        """
-        if isinstance(source_location, str) and source_location.startswith("@intermediate:"):
-            key = source_location.split(":", 1)[1]
-            if key not in intermediate_map:
-                raise ValueError(f"Unknown intermediate source token: {source_location}")
-            return intermediate_map[key]
-        return source_location
-
-    def _record_prepare_transfer(
+    def _augment_prepare_result(
         self,
-        stage_type,
-        source,
-        dest,
-        requested_volume_ul,
-        source_stock_name,
-        transfer_params,
-        transfer_result,
-        planned_transfer=None,
-        extra=None,
-    ):
-        """Append a structured preparation transfer record.
+        result: dict,
+        destination: str,
+        intermediate_destinations: list[str],
+        planned_mass_transfers: dict | None,
+        procedure_plan: dict,
+    ) -> dict:
+        augmented = copy.deepcopy(result)
+        augmented["destination"] = destination
+        augmented["intermediate_destinations"] = list(intermediate_destinations)
+        augmented["procedure_plan"] = copy.deepcopy(procedure_plan)
+        augmented["planned_mass_transfers"] = self._serialize_planned_mass_transfers(
+            planned_mass_transfers
+        )
+        prepare_meta = self._ensure_prepare_metadata()
+        if prepare_meta is not None:
+            augmented["executed_transfers"] = copy.deepcopy(
+                prepare_meta.get("executed_transfers", [])
+            )
+        return augmented
 
-        Parameters
-        ----------
-        stage_type : str
-            Preparation stage label such as ``"single"`` or ``"final_mix"``.
-        source, dest : str
-            Source and destination deck locations.
-        requested_volume_ul : float
-            Requested transfer volume in microliters.
-        source_stock_name : str or None
-            Stock name associated with the source location.
-        transfer_params : dict
-            Transfer keyword arguments used for execution.
-        transfer_result : dict
-            Result returned by :meth:`transfer`.
-        planned_transfer : dict, optional
-            Original planned transfer metadata.
-        extra : dict, optional
-            Additional fields merged into the stored record.
-        """
-        entry = {
-            "stage_type": stage_type,
-            "source_location": source,
-            "dest_location": dest,
-            "source_stock_name": source_stock_name,
-            "requested_volume_ul": float(requested_volume_ul),
-            "transfer_params": dict(transfer_params or {}),
-            "transfer_result": transfer_result,
-        }
-        if planned_transfer is not None:
-            entry["planned_transfer"] = planned_transfer
-        if extra:
-            entry.update(extra)
-        self._append_prepare_transfer(entry)
+    def _destination_queue_key(self) -> str | None:
+        if "prep_targets" in self.config:
+            return "prep_targets"
+        if "mixing_locations" in self.config:
+            return "mixing_locations"
+        return None
 
-    def _transfer_stage(
+    def _reserve_destinations(
         self,
-        source,
-        dest,
-        volume_ul,
-        stage_type,
-        source_stock_name=None,
-        planned_transfer=None,
-        extra=None,
-    ):
-        """Execute and record one staged preparation transfer.
+        dest: str | None,
+        required_intermediate_targets: int,
+    ) -> tuple[str, list[str], list[str], str | None]:
+        if required_intermediate_targets <= 0:
+            destination = self.resolve_destination(dest)
+            return destination, [], [], None
 
-        Parameters
-        ----------
-        source, dest : str
-            Source and destination deck locations.
-        volume_ul : float
-            Transfer volume in microliters.
-        stage_type : str
-            Stage label used in transfer bookkeeping.
-        source_stock_name : str, optional
-            Stock name associated with the source.
-        planned_transfer : dict, optional
-            Planned transfer metadata.
-        extra : dict, optional
-            Additional bookkeeping fields.
-        """
-        if float(volume_ul) <= 0:
+        queue_key = self._destination_queue_key()
+        if queue_key is None:
+            raise ValueError(
+                "Multi-step prepare requires a configured destination queue (prep_targets or mixing_locations)."
+            )
+        queue = list(self.config.get(queue_key, []))
+        needed = required_intermediate_targets + (0 if dest is not None else 1)
+        if len(queue) < needed:
+            raise ValueError(
+                f"Not enough {queue_key} entries for multi-step preparation. "
+                f"Need {needed}, found {len(queue)}."
+            )
+        consumed = queue[:needed]
+        self.config[queue_key] = queue[needed:]
+        intermediate_destinations = consumed[:required_intermediate_targets]
+        destination = dest if dest is not None else consumed[required_intermediate_targets]
+        return destination, intermediate_destinations, consumed, queue_key
+
+    def _restore_reserved_destinations(self, queue_key: str | None, consumed: list[str]) -> None:
+        if not queue_key or not consumed:
             return
-        stock_name = source_stock_name
-        if stock_name is None:
-            stock_name = self.config.get("deck", {}).get(source)
-        selected_tip_location = None
-        if stock_name is not None:
-            transfer_params, selected_tip_location = self._build_stock_transfer_params(
-                stock_name=stock_name,
-                volume_ul=volume_ul,
+        queue = list(self.config.get(queue_key, []))
+        self.config[queue_key] = consumed + queue
+
+    def prepare(
+        self,
+        target: dict,
+        dest: str | None = None,
+        enable_multistep_dilution: bool | None = None,
+    ) -> tuple[dict, str] | tuple[None, None]:
+        requested_target = copy.deepcopy(target)
+        target = self.apply_fixed_comps(target)
+        if enable_multistep_dilution is None:
+            enable_multistep_dilution = bool(self.config.get("enable_multistep_dilution", False))
+        self._update_prepare_metadata(
+            requested_target=requested_target,
+            applied_target=copy.deepcopy(target),
+            requested_destination=dest,
+            destination=None,
+            intermediate_destinations=[],
+            enable_multistep_dilution=bool(enable_multistep_dilution),
+            feasible_result=None,
+            balanced_target=None,
+            planned_mass_transfers=None,
+            procedure_plan=None,
+            execution_success=False,
+        )
+
+        if self._uses_stock_volume_fractions(target):
+            feasible_result, balanced_target, procedure_plan, planned_mass_transfers = (
+                self._build_stock_volume_fraction_prepare_target(target)
             )
         else:
-            transfer_params = self.get_transfer_params("default")
-        transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
-        self._activate_stock_tip_reservation(stock_name, selected_tip_location)
-        self._record_prepare_transfer(
-            stage_type=stage_type,
-            source=source,
-            dest=dest,
-            requested_volume_ul=float(volume_ul),
-            source_stock_name=stock_name,
-            transfer_params=transfer_params,
-            transfer_result=transfer_result,
-            planned_transfer=planned_transfer,
-            extra=extra,
-        )
-
-    def execute_preparation_plan(self, target, balanced_target, destination, procedure_plan, intermediate_destinations):
-        """Execute a staged preparation plan with intermediates.
-
-        Parameters
-        ----------
-        target : object
-            Original target specification.
-        balanced_target : object
-            Balanced target object associated with the plan.
-        destination : str
-            Final destination location.
-        procedure_plan : dict
-            Staged plan containing dilution and final-mix steps.
-        intermediate_destinations : sequence of str
-            Concrete deck locations assigned to intermediate stages.
-
-        Returns
-        -------
-        bool
-            ``True`` when the plan completes successfully.
-
-        Raises
-        ------
-        ValueError
-            If the intermediate mapping is inconsistent or a stage type is
-            unknown.
-
-        Examples
-        --------
-        >>> driver.execute_pre preparation_plan(target, balanced_target, "4A1", plan, ["5A1"])
-        True
-        """
-        intermediate_ids = procedure_plan.get("intermediate_ids", [])
-        if len(intermediate_ids) != len(intermediate_destinations):
-            raise ValueError(
-                f"Intermediate destination mismatch. Need {len(intermediate_ids)}, got {len(intermediate_destinations)}."
+            feasibility_results = self.is_feasible(
+                target,
+                enable_multistep_dilution=bool(enable_multistep_dilution),
             )
-        intermediate_map = {
-            intermediate_id: intermediate_destinations[i]
-            for i, intermediate_id in enumerate(intermediate_ids)
-        }
-
-        stages = procedure_plan.get("stages", [])
-        for stage in stages:
-            stage_type = stage.get("stage_type")
-            if stage_type == "dilution":
-                dest_token = stage.get("destination_token")
-                if not isinstance(dest_token, str) or not dest_token.startswith("@intermediate:"):
-                    raise ValueError(f"Invalid dilution destination token: {dest_token}")
-                intermediate_id = dest_token.split(":", 1)[1]
-                if intermediate_id not in intermediate_map:
-                    raise ValueError(f"No destination assigned for intermediate '{intermediate_id}'")
-                stage_dest = intermediate_map[intermediate_id]
-
-                source_loc = self._resolve_stage_source(stage.get("source_location"), intermediate_map)
-                diluent_loc = self._resolve_stage_source(stage.get("diluent_location"), intermediate_map)
-                source_mass_g = float(stage.get("total_source_mass_g", 0.0))
-                diluent_mass_g = float(stage.get("total_diluent_mass_g", 0.0))
-                if source_mass_g > 0:
-                    source_stock = self.stocks_by_location(source_loc)
-                    source_volume = source_stock.measure_out(f"{source_mass_g} g").volume.to("ul").magnitude
-                    self._transfer_stage(
-                        source_loc,
-                        stage_dest,
-                        source_volume,
-                        stage_type="dilution",
-                        source_stock_name=stage.get("source_stock_name"),
-                        planned_transfer={
-                            "required_mass_g": source_mass_g,
-                            "source_location": source_loc,
-                            "destination_token": dest_token,
-                        },
-                        extra={
-                            "intermediate_id": intermediate_id,
-                            "destination_token": dest_token,
-                            "dilution_factor": stage.get("dilution_factor"),
-                            "batches": stage.get("batches"),
-                            "transfer_role": "source",
-                            "intermediate_location": stage_dest,
-                        },
-                    )
-                if diluent_mass_g > 0:
-                    diluent_stock = self.stocks_by_location(diluent_loc)
-                    diluent_volume = diluent_stock.measure_out(f"{diluent_mass_g} g").volume.to("ul").magnitude
-                    self._transfer_stage(
-                        diluent_loc,
-                        stage_dest,
-                        diluent_volume,
-                        stage_type="dilution",
-                        source_stock_name=stage.get("diluent_stock_name"),
-                        planned_transfer={
-                            "required_mass_g": diluent_mass_g,
-                            "source_location": diluent_loc,
-                            "destination_token": dest_token,
-                        },
-                        extra={
-                            "intermediate_id": intermediate_id,
-                            "destination_token": dest_token,
-                            "dilution_factor": stage.get("dilution_factor"),
-                            "batches": stage.get("batches"),
-                            "transfer_role": "diluent",
-                            "intermediate_location": stage_dest,
-                        },
-                    )
-            elif stage_type == "final_mix":
-                for transfer in stage.get("transfers", []):
-                    source_loc = self._resolve_stage_source(transfer.get("source_location"), intermediate_map)
-                    vol_ul = float(transfer.get("required_volume_ul", 0.0))
-                    if vol_ul <= 0:
-                        continue
-                    self._transfer_stage(
-                        source_loc,
-                        destination,
-                        vol_ul,
-                        stage_type="final_mix",
-                        source_stock_name=transfer.get("source_stock_name"),
-                        planned_transfer=transfer,
-                        extra={
-                            "destination_location": destination,
-                        },
-                    )
-            else:
-                raise ValueError(f"Unknown stage type '{stage_type}' in procedure plan")
-
-        self.last_target_location = destination
-        self._mark_sample_locations_occupied(list(intermediate_destinations) + [destination])
-        return True
-
-    def stocks_by_location(self, location):
-        """Return the configured stock object at a deck location.
-
-        Parameters
-        ----------
-        location : str
-            Deck location associated with a configured stock.
-
-        Returns
-        -------
-        object
-            Matching stock object.
-
-        Raises
-        ------
-        ValueError
-            If no stock is configured at the requested location.
-        """
-        for stock in self.stocks:
-            if stock.location == location:
-                return stock
-        raise ValueError(f"No stock configured at location '{location}'")
-
-    def build_prepare_result(self, feasible_result, balanced_target):
-        """Build the serialized result payload for a preparation.
-
-        Parameters
-        ----------
-        feasible_result : object
-            Feasibility result from the preparation workflow.
-        balanced_target : object
-            Balanced target object to serialize.
-
-        Returns
-        -------
-        dict
-            Serialized target data with total volume included when available.
-        """
-        result_dict = balanced_target.to_dict()
-        if hasattr(balanced_target, "volume") and balanced_target.volume is not None:
-            result_dict["total_volume"] = f"{balanced_target.volume.to('ul').magnitude} ul"
-        return result_dict
-
-    def process_stocks(self):
-        """Process stocks and refresh deck-derived preparation state.
-
-        Notes
-        -----
-        This extends :class:`PrepareDriver` stock processing by rebuilding the
-        reverse deck map and stock-tip reservation state.
-        """
-        PrepareDriver.process_stocks(self)
-        self._update_deck_config()
-        self._sync_stock_tip_tracking()
-
-    def _update_deck_config(self):
-        """Rebuild the reverse deck map from stock locations.
-
-        Examples
-        --------
-        >>> driver._update_deck_config()
-        >>> isinstance(driver.config.get("deck", {}), dict)
-        True
-        """
-        deck_config = {}
-        stock_locations = self.config.get("stock_locations", {})
-        for stock_name, deck_location in stock_locations.items():
-            deck_config[deck_location] = stock_name
-        self.config["deck"] = deck_config
-
-    def get_transfer_params(self, stock_name):
-        """Return merged transfer parameters for a stock.
-
-        Parameters
-        ----------
-        stock_name : str
-            Stock identifier.
-
-        Returns
-        -------
-        dict
-            Default transfer parameters overlaid with stock-specific overrides.
-
-        Examples
-        --------
-        >>> isinstance(driver.get_transfer_params("default"), dict)
-        True
-        """
-        stock_params = self.config.get("stock_transfer_params", {}).get(stock_name, {})
-        default_params = self.config.get("stock_transfer_params", {}).get("default", {})
-        params = default_params.copy()
-        params.update(stock_params)
-        return params
-
-    def reorder_protocol(self, protocol):
-        """Reorder protocol steps according to configured stock order.
-
-        Parameters
-        ----------
-        protocol : sequence
-            Protocol steps with a ``source`` attribute.
-
-        Returns
-        -------
-        list
-            Reordered protocol steps.
-        """
-        stock_mix_order = self.config.get("stock_mix_order", [])
-        if not stock_mix_order:
-            return protocol
-
-        steps_by_source = {}
-        for step in protocol:
-            if step.source not in steps_by_source:
-                steps_by_source[step.source] = []
-            steps_by_source[step.source].append(step)
-
-        reordered = []
-        for stock_name in stock_mix_order:
-            if stock_name in steps_by_source:
-                reordered.extend(steps_by_source[stock_name])
-                del steps_by_source[stock_name]
-
-        for steps in steps_by_source.values():
-            reordered.extend(steps)
-        return reordered
-
-    def transfer_to_catch(self, source=None, dest=None, **kwargs):
-        """Transfer a prepared sample into the configured catch destination.
-
-        Parameters
-        ----------
-        source : str, optional
-            Source location. Defaults to the last preparation destination.
-        dest : str, optional
-            Destination override for the catch transfer.
-        **kwargs
-            Additional transfer keyword arguments merged into the configured
-            catch protocol.
-
-        Returns
-        -------
-        None
-            The method raises on failure and records the transfer on success.
-
-        Raises
-        ------
-        ValueError
-            If no source or destination can be resolved.
-        RuntimeError
-            If the underlying transfer fails.
-        """
-        catch_params = self.config.get("catch_protocol", {}).copy()
-        if source is None:
-            if self.last_target_location is None:
-                raise ValueError(
-                    "No source specified and no last target location available. "
-                    "Call prepare() first or specify source."
+            if not feasibility_results or feasibility_results[0] is None:
+                self._update_prepare_metadata(
+                    feasible_result=None,
+                    balanced_target=None,
+                    planned_mass_transfers=None,
+                    procedure_plan=None,
+                    execution_success=False,
                 )
-            source = self.last_target_location
-        kwargs["source"] = source
+                warnings.warn(
+                    f"Target composition {target.get('name', 'Unnamed target')} is not feasible "
+                    f"based on mass balance calculations",
+                    stacklevel=2,
+                )
+                return None, None
 
-        if dest is not None:
-            kwargs["dest"] = dest
+            feasible_result = feasibility_results[0]
 
-        catch_params.update(kwargs)
-        if "dest" not in catch_params:
-            raise ValueError("Destination 'dest' must be specified in catch_protocol config or as an argument.")
+            self.before_balance(target)
+
+            self.reset_targets()
+            self.add_target(target)
+            self.balance(enable_multistep_dilution=bool(enable_multistep_dilution))
+
+            if not self.balanced or not self.balanced[0].get("balanced_target"):
+                warnings.warn(
+                    f"No suitable mass balance found for target: {target.get('name', 'Unnamed target')}",
+                    stacklevel=2,
+                )
+                procedure_plan = self.balanced[0].get("procedure_plan") or {}
+                self._update_prepare_metadata(
+                    feasible_result=copy.deepcopy(feasible_result),
+                    balanced_target=None,
+                    planned_mass_transfers=self._serialize_planned_mass_transfers(
+                        self.balanced[0].get("transfers")
+                    ),
+                    procedure_plan=copy.deepcopy(procedure_plan),
+                    execution_success=False,
+                )
+                return None, None
+
+            balanced_target = self.balanced[0]["balanced_target"]
+            procedure_plan = self.balanced[0].get("procedure_plan") or {}
+            planned_mass_transfers = self.balanced[0].get("transfers")
+
+        required_intermediate_targets = int(procedure_plan.get("required_intermediate_targets", 0))
+        destination, intermediate_destinations, consumed, queue_key = self._reserve_destinations(
+            dest=dest,
+            required_intermediate_targets=required_intermediate_targets,
+        )
+        self._update_prepare_metadata(
+            feasible_result=copy.deepcopy(feasible_result),
+            balanced_target=balanced_target.to_dict(),
+            planned_mass_transfers=self._serialize_planned_mass_transfers(planned_mass_transfers),
+            procedure_plan=copy.deepcopy(procedure_plan),
+            destination=destination,
+            intermediate_destinations=list(intermediate_destinations),
+        )
 
         try:
-            transfer_result = self.transfer(**catch_params)
-            self._record_prepare_transfer(
-                stage_type="catch",
-                source=catch_params["source"],
-                dest=catch_params["dest"],
-                requested_volume_ul=float(catch_params.get("volume", 0.0)),
-                source_stock_name=self.config.get("deck", {}).get(catch_params["source"]),
-                transfer_params={k: v for k, v in catch_params.items() if k not in ("source", "dest", "volume")},
-                transfer_result=transfer_result,
-            )
-        except Exception as e:
-            dest_val = catch_params.get("dest", "unknown")
-            warnings.warn(
-                f"Transfer to catch failed from {source} to {dest_val} using {catch_params}: {str(e)}",
-                stacklevel=2,
-            )
+            if required_intermediate_targets > 0:
+                success = self.execute_preparation_plan(
+                    target=target,
+                    balanced_target=balanced_target,
+                    destination=destination,
+                    procedure_plan=procedure_plan,
+                    intermediate_destinations=intermediate_destinations,
+                )
+            else:
+                success = self.execute_preparation(target, balanced_target, destination)
+            if success is False:
+                self._update_prepare_metadata(execution_success=False)
+                return None, None
+        except Exception:
+            self._update_prepare_metadata(execution_success=False)
+            if required_intermediate_targets > 0:
+                self._restore_reserved_destinations(queue_key=queue_key, consumed=consumed)
+            else:
+                self.on_prepare_exception(destination=destination, dest_was_none=(dest is None))
             raise
 
-    def load_gen1_p10(self, mount, tip_rack_slots, **kwargs):
-        """Load a GEN1 P10 single-channel pipette.
-
-        Parameters
-        ----------
-        mount : {"left", "right"}
-            Mount on which to load the pipette.
-        tip_rack_slots : sequence of str
-            Tiprack slots associated with the pipette.
-        **kwargs
-            Additional keyword arguments forwarded to :meth:`load_instrument`.
-
-        Returns
-        -------
-        str
-            Loaded pipette identifier returned by the robot.
-        """
-        return self.load_instrument(
-            name="p10_single",
-            mount=mount,
-            tip_rack_slots=tip_rack_slots,
-            **kwargs,
-        )
-
-    def reset(self):
-        """Reset preparation targets and stock state.
-
-        Notes
-        -----
-        This reset is preparation-focused and delegates to
-        :class:`PrepareDriver` helpers rather than resetting the OT-2 run.
-        """
-        self.reset_targets()
-        self.reset_stocks()
-
-
-_DEFAULT_PORT = 5002
-if __name__ == "__main__":
-    from AFL.automation.shared.launcher import *
+        self._update_prepare_metadata(execution_success=True)
+        result = self.build_prepare_result(feasible_result, balanced_target)
+        return self._augment_prepare_result(
+            result=result,
+            destination=destination,
+            intermediate_destinations=intermediate_destinations,
+            planned_mass_transfers=planned_mass_transfers,
+            procedure_plan=procedure_plan,
+        ), destination
