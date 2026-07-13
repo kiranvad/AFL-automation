@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 import lazy_loader as lazy
@@ -9,7 +10,6 @@ import lazy_loader as lazy
 from AFL.automation.APIServer.Driver import Driver
 
 if TYPE_CHECKING:
-    from AFL.automation.APIServer.Client import Client
     from AFL.automation.shared.motors import ServoMotor, StepperMotor
 
 
@@ -18,10 +18,10 @@ class VialCapperDecapper(Driver):
     AFL driver for coordinated vial capping and decapping workflows.
 
     This driver combines a servo gripper, a stepper-driven cap rotation stage,
-    and an xArm client. During threaded capping and decapping, the xArm is
-    assumed to move only in the Z direction while the stepper rotates the cap.
-    The axial Z travel is computed from the vial thread pitch and applied in
-    small segments so the cap follows the thread safely.
+    and direct xArm Python SDK control. During threaded capping and decapping,
+    the xArm is assumed to move only in the Z direction while the stepper
+    rotates the cap. The axial Z travel is computed from the vial thread pitch
+    and applied in small segments so the cap follows the thread safely.
 
     Parameters
     ----------
@@ -29,9 +29,8 @@ class VialCapperDecapper(Driver):
         Pre-configured servo helper used to grip and release the cap.
     stepper_motor : StepperMotor
         Pre-configured stepper helper used to rotate the cap.
-    xarm_client : Client
-        AFL client connected to a running xArm server. The xArm is expected to
-        support queued ``move`` and ``move_axis`` commands.
+    xarm_host : str
+        Hostname or IP address for the xArm controller used by the Python SDK.
     overrides : dict, optional
         Driver configuration overrides merged with :attr:`defaults`.
     name : str, default="VialCapperDecapper"
@@ -66,12 +65,17 @@ class VialCapperDecapper(Driver):
         Rotation increment per coordinated step. Smaller values produce more
         frequent Z updates.
     ``xarm_grip_location`` : str or None
-        Named xArm location where the vial engages the gripper.
+        Name of the configured grip pose used in status and sequence summaries.
     ``xarm_safe_location`` : str or None
-        Named xArm location used as the safe approach and retreat waypoint for
-        the full sequence.
+        Name of the configured safe pose used in status and sequence summaries.
+    ``xarm_grip_pose`` : list[float] or None
+        Cartesian pose ``[x, y, z, roll, pitch, yaw]`` used while the vial is in
+        the gripper.
+    ``xarm_safe_pose`` : list[float] or None
+        Cartesian pose ``[x, y, z, roll, pitch, yaw]`` used as the safe approach
+        and retreat waypoint.
     ``xarm_move_timeout`` : float, default=300
-        Timeout in seconds used while waiting for queued xArm moves.
+        Timeout in seconds used for blocking SDK cartesian moves.
     ``xarm_approach_from_below`` : bool, default=True
         If ``True``, the xArm presents the vial to the gripper from below.
     ``xarm_remove_by_lowering`` : bool, default=True
@@ -103,8 +107,8 @@ class VialCapperDecapper(Driver):
         Servo helper used for cap gripping.
     stepper : StepperMotor
         Stepper helper used for cap rotation.
-    xarm_client : Client or None
-        Client used to issue xArm motion commands.
+    xarm_host : str
+        Hostname or IP address used to open xArm SDK sessions.
     held_cap : dict or None
         Metadata describing the currently held cap after decapping.
     last_sequence : dict or None
@@ -112,12 +116,12 @@ class VialCapperDecapper(Driver):
 
     Examples
     --------
-    Create a driver with injected hardware helpers and an xArm client.
+    Create a driver with injected hardware helpers and direct xArm SDK access.
 
     >>> driver = VialCapperDecapper(
     ...     servo_motor=servo,
     ...     stepper_motor=stepper,
-    ...     xarm_client=client,
+    ...     xarm_host="192.168.1.42",
     ...     overrides={
     ...         "vial_spec": {
     ...             "thread_pitch_mm_per_turn": 1.5,
@@ -144,7 +148,11 @@ class VialCapperDecapper(Driver):
         },
         "xarm_grip_location": None,
         "xarm_safe_location": None,
+        "xarm_grip_pose": None,
+        "xarm_safe_pose": None,
         "xarm_move_timeout": 300,
+        "arm_move_speed": 100.0,
+        "arm_move_accel": 2000.0,
         "xarm_approach_from_below": True,
         "xarm_remove_by_lowering": True,
         "xarm_return_to_safe_after_rotation": True,
@@ -162,7 +170,7 @@ class VialCapperDecapper(Driver):
         self,
         servo_motor: ServoMotor,
         stepper_motor: StepperMotor,
-        xarm_client: Client,
+        xarm_host: str,
         overrides: Optional[Dict[str, Any]] = None,
         name: str = "VialCapperDecapper",
     ) -> None:
@@ -175,8 +183,8 @@ class VialCapperDecapper(Driver):
             Pre-configured servo helper used to grip and release caps.
         stepper_motor : StepperMotor
             Pre-configured stepper helper used to rotate caps.
-        xarm_client : Client
-            AFL client connected to a running xArm server.
+        xarm_host : str
+            Hostname or IP address for the xArm controller.
         overrides : dict, optional
             Driver configuration overrides merged with :attr:`defaults`.
         name : str, default="VialCapperDecapper"
@@ -187,7 +195,7 @@ class VialCapperDecapper(Driver):
         >>> driver = VialCapperDecapper(
         ...     servo_motor=servo,
         ...     stepper_motor=stepper,
-        ...     xarm_client=client,
+        ...     xarm_host="192.168.1.42",
         ... )
         >>> driver.connected
         False
@@ -196,7 +204,7 @@ class VialCapperDecapper(Driver):
         self._data = None
         ServoMotor = lazy.load("AFL.automation.shared.motors.ServoMotor", require="AFL-automation[adafruit]")
         StepperMotor = lazy.load("AFL.automation.shared.motors.StepperMotor", require="AFL-automation[rpi-gpio]")
-        Client = lazy.load("AFL.automation.APIServer.Client", require="AFL-automation[xarm]")
+        self.XArmAPI = lazy.load("xarm.wrapper.XArmAPI", require="AFL-automation[xarm]")
 
         defaults = self.gather_defaults()
         defaults["servo"] = dict(ServoMotor.DEFAULTS)
@@ -211,19 +219,18 @@ class VialCapperDecapper(Driver):
             raise TypeError(
                 f"stepper_motor must be an instance of {StepperMotor.__module__}.{StepperMotor.__name__}"
             )
-        if not isinstance(xarm_client, Client):
-            raise TypeError(
-                f"xarm_client must be an instance of {Client.__module__}.{Client.__name__}"
-            )
+        if not isinstance(xarm_host, str) or not xarm_host.strip():
+            raise TypeError("xarm_host must be a non-empty string")
 
         self.logger.setLevel(self.config["log_level"])
         self.servo = servo_motor
         self.stepper = stepper_motor
-        self.xarm_client = xarm_client
+        self.xarm_host = xarm_host.strip()
 
         self.connected = False
         self.held_cap: Optional[Dict[str, Any]] = None
         self.last_sequence: Optional[Dict[str, Any]] = None
+        self._xarm_motion_lock = threading.Lock()
 
     @property
     def app(self):
@@ -280,29 +287,25 @@ class VialCapperDecapper(Driver):
                 helper.data = data
 
     @Driver.unqueued()
-    def attach_xarm_client(self, xarm_client: Client) -> str:
+    def set_xarm_host(self, xarm_host: str) -> str:
         """
-        Attach a running xArm client to the driver.
+        Update the xArm controller host used for SDK sessions.
 
         Parameters
         ----------
-        xarm_client : Client
-            AFL client connected to the xArm server used for vial positioning and
-            Z-axis thread following.
+        xarm_host : str
+            Hostname or IP address for the xArm controller.
 
         Returns
         -------
         str
-            Confirmation message indicating that the client was attached.
-
-        Examples
-        --------
-        >>> driver.attach_xarm_client(client)
-        'Attached provided xArm client'
+            Confirmation message indicating that the host was updated.
         """
-        self.xarm_client = xarm_client
-        self.logger.debug("Attached xArm client: %s", xarm_client)
-        return "Attached provided xArm client"
+        if not isinstance(xarm_host, str) or not xarm_host.strip():
+            raise TypeError("xarm_host must be a non-empty string")
+        self.xarm_host = xarm_host.strip()
+        self.logger.debug("Updated xArm host: %s", self.xarm_host)
+        return "Updated xArm host"
 
     @Driver.unqueued()
     def connect(self) -> str:
@@ -458,9 +461,11 @@ class VialCapperDecapper(Driver):
             "last_sequence": self.last_sequence,
             "servo": self.servo.status(),
             "stepper": self.stepper.status(),
-            "xarm_client_attached": self.xarm_client is not None,
+            "xarm_host": self.xarm_host,
             "xarm_grip_location": self.config["xarm_grip_location"],
             "xarm_safe_location": self.config["xarm_safe_location"],
+            "xarm_grip_pose": self.config["xarm_grip_pose"],
+            "xarm_safe_pose": self.config["xarm_safe_pose"],
             "vial_spec": self.config["vial_spec"],
         }
 
@@ -660,9 +665,6 @@ class VialCapperDecapper(Driver):
             resolved_vial_spec,
         )
 
-        if any(value is not None for value in (resolved_grip_location, resolved_safe_location)):
-            self._require_xarm_client()
-
         stage_result = self._stage_vial_for_capper(
             grip_location=resolved_grip_location,
             safe_location=resolved_safe_location,
@@ -791,58 +793,31 @@ class VialCapperDecapper(Driver):
         self.logger.debug("Resolved vial specification: %s", vial_spec)
         return vial_spec
 
-    def _require_xarm_client(self) -> Client:
-        """
-        Return the attached xArm client or raise an error.
-
-        Returns
-        -------
-        Client
-            Attached AFL client used for xArm motion commands.
-
-        Raises
-        ------
-        RuntimeError
-            Raised when no xArm client has been attached.
-        """
-        if self.xarm_client is None:
-            raise RuntimeError("An xArm client must be attached before using location-based capping sequences")
-        return self.xarm_client
-
     def _move_xarm(self, location: str, above: bool) -> Dict[str, Any]:
         """
-        Queue and wait for a named xArm move.
+        Move the xArm to a configured cartesian pose using the Python SDK.
 
         Parameters
         ----------
         location : str
-            Named xArm location to move to.
+            Configured pose name to move to.
         above : bool
-            Motion mode flag forwarded to the xArm server to indicate whether the
-            move should approach above or below the named location.
+            Included for API compatibility with the existing sequence flow. The
+            current SDK-only implementation uses the configured pose directly.
 
         Returns
         -------
         dict
-            Summary containing the target location, approach mode, and queue
-            UUID.
-
-        Raises
-        ------
-        RuntimeError
-            Raised when no xArm client is attached or when the xArm server does
-            not return a queue UUID.
+            Summary containing the target location, approach mode, and pose.
         """
-        client = self._require_xarm_client()
-        self.logger.debug("Queueing xArm move to location=%s above=%s", location, above)
-        response = client.enqueue(task_name="move", interactive=True, location=location, above=above)
-        uuid = response.get("uuid")
-        if uuid is None:
-            raise RuntimeError(f"xArm move command did not return a queue uuid for location {location}")
-        self.logger.debug("Waiting for xArm move uuid=%s location=%s above=%s", uuid, location, above)
-        client.wait(uuid, timeout=self.config["xarm_move_timeout"])
-        self.logger.debug("Completed xArm move uuid=%s location=%s above=%s", uuid, location, above)
-        return {"location": location, "above": above, "uuid": uuid}
+        target_pose = self._resolve_xarm_pose(location=location)
+        code = self._move_xarm_pose(target_pose)
+        return {
+            "location": location,
+            "above": above,
+            "target_pose": target_pose,
+            "code": code,
+        }
 
     def _move_xarm_axis(
         self,
@@ -852,61 +827,103 @@ class VialCapperDecapper(Driver):
         require_location: bool = False,
     ) -> Dict[str, Any]:
         """
-        Move the xArm incrementally along a single axis.
-
-        Parameters
-        ----------
-        location : str, optional
-            Named reference location used by the xArm server for the incremental
-            move.
-        axis : str
-            Axis to move. Threaded capping sequences use only ``"z"``.
-        delta_mm : float
-            Signed incremental travel in millimeters.
-        require_location : bool, default=False
-            If ``True``, raise an error when ``location`` is not provided.
-
-        Returns
-        -------
-        dict
-            Summary of the queued xArm axis move.
-
-        Raises
-        ------
-        RuntimeError
-            Raised when no xArm client is attached, when a required location is
-            missing, or when the xArm server does not return a queue UUID.
+        Move the xArm incrementally along a single axis using the xArm Python SDK.
         """
-        client = self._require_xarm_client()
         if location is None and require_location:
             raise RuntimeError("A grip location is required for threaded xArm axial moves")
+        if location is None:
+            raise RuntimeError("xArm axial moves require a configured pose name in VialCapperDecapper")
+
+        axis = axis.lower()
+        axis_map = {"x": 0, "y": 1, "z": 2, "roll": 3, "pitch": 4, "yaw": 5}
+        if axis not in axis_map:
+            raise ValueError(f"Unsupported xArm axis: {axis}")
 
         self.logger.debug(
-            "Queueing xArm axis move location=%s axis=%s delta_mm=%s require_location=%s",
+            "Running SDK xArm axis move location=%s axis=%s delta_mm=%s require_location=%s",
             location,
             axis,
             delta_mm,
             require_location,
         )
-        response = client.enqueue(
-            task_name="move_axis",
-            interactive=True,
-            location=location,
-            axis=axis,
-            delta_mm=delta_mm,
-        )
-        uuid = response.get("uuid")
-        if uuid is None:
-            raise RuntimeError(f"xArm axis move command did not return a queue uuid for axis {axis}")
-        self.logger.debug("Waiting for xArm axis move uuid=%s axis=%s delta_mm=%s", uuid, axis, delta_mm)
-        client.wait(uuid, timeout=self.config["xarm_move_timeout"])
-        self.logger.debug("Completed xArm axis move uuid=%s axis=%s delta_mm=%s", uuid, axis, delta_mm)
+
+        base_pose = self._resolve_xarm_pose(location=location)
+        target_pose = list(base_pose)
+        target_pose[axis_map[axis]] += delta_mm
+        code = self._move_xarm_pose(target_pose)
+
         return {
             "location": location,
             "axis": axis,
             "delta_mm": delta_mm,
-            "uuid": uuid,
+            "target_pose": target_pose,
+            "code": code,
         }
+
+    def _resolve_xarm_pose(self, location: str) -> list[float]:
+        """
+        Resolve a configured xArm pose name to a cartesian pose.
+
+        Parameters
+        ----------
+        location : str
+            Configured pose name. Supported values are the configured grip and
+            safe locations.
+
+        Returns
+        -------
+        list of float
+            Pose in the form ``[x, y, z, roll, pitch, yaw]``.
+        """
+        pose_map = {
+            self.config["xarm_grip_location"]: self.config["xarm_grip_pose"],
+            self.config["xarm_safe_location"]: self.config["xarm_safe_pose"],
+        }
+        pose = pose_map.get(location)
+        if pose is None:
+            raise RuntimeError(f"No configured xArm pose is available for location {location!r}")
+        if not isinstance(pose, list) or len(pose) != 6:
+            raise RuntimeError(f"Configured xArm pose for {location!r} is invalid: {pose!r}")
+        return [float(value) for value in pose]
+
+    def _move_xarm_pose(self, pose: list[float]) -> int:
+        """
+        Execute a blocking cartesian move through the xArm Python SDK.
+        """
+        with self._xarm_motion_lock:
+            sdk_arm = self._connect_xarm_sdk()
+            try:
+                code = sdk_arm.set_position(
+                    *pose,
+                    speed=self.config["arm_move_speed"],
+                    mvacc=self.config["arm_move_accel"],
+                    radius=-1.0,
+                    wait=True,
+                )
+            finally:
+                disconnect = getattr(sdk_arm, "disconnect", None)
+                if callable(disconnect):
+                    disconnect()
+        if code:
+            raise RuntimeError(f"xArm SDK move failed for pose {pose}: code={code}")
+        return code
+
+    def _connect_xarm_sdk(self):
+        """
+        Create a short-lived xArm SDK session using the configured xArm host.
+
+        Returns
+        -------
+        XArmAPI
+            Connected xArm SDK client ready for cartesian motion commands.
+        """
+        if not self.xarm_host:
+            raise RuntimeError("xarm_host must be configured before using xArm motions")
+        sdk_arm = self.XArmAPI(self.xarm_host)
+        connect = getattr(sdk_arm, "connect", None)
+        if callable(connect):
+            connect()
+        return sdk_arm
 
     def _stage_vial_for_capper(
         self,
@@ -1108,10 +1125,7 @@ _DEFAULT_PORT = 5057
 _DEFAULT_CUSTOM_CONFIG = {
     "_classname": "AFL.automation.manipulate.VialCapperDecapper.VialCapperDecapper",
     "_args": [],
-    "xarm_client": {
-        "_classname": "AFL.automation.APIServer.Client.Client",
-        "host": "localhost:5050",
-    },
+    "xarm_host": "localhost",
 }
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import atexit
+import importlib
 import logging
 import time
 from typing import Dict, Optional
@@ -143,12 +144,21 @@ class ServoMotor(Motor):
         self.default_speed = config["default_speed"]
         self.state = "unknown"
         self.angle: Optional[int] = None
+        self.connected = False
+        self.kit = None
+        self.i2c = None
 
-        self.ServoKit = lazy.load("adafruit_servokit.ServoKit", require="adafruit-circuitpython-servokit")
-        self.kit = self.ServoKit(channels=self.channels, address=self.address)
-        self.kit.servo[self.channel].set_pulse_width_range(self.pulse_min, self.pulse_max)
+        try:
+            self.ServoKit = lazy.load("adafruit_servokit.ServoKit", require="AFL-automation[adafruit]")
+            self.I2C = lazy.load("busio.I2C", require="AFL-automation[adafruit]")
+            self.board = lazy.load("board", require="AFL-automation[adafruit]")
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "ServoMotor requires the AFL-automation[adafruit] extra to be installed."
+            ) from exc
+
         self.logger.debug(
-            "Initialized servo motor channel=%s address=%s bus=%s angle_range=(%s,%s) pulse_range=(%s,%s) default_speed=%s",
+            "Initialized servo motor config channel=%s address=%s bus=%s angle_range=(%s,%s) pulse_range=(%s,%s) default_speed=%s",
             self.channel,
             self.address,
             self.bus,
@@ -161,6 +171,44 @@ class ServoMotor(Motor):
 
         if config["register_cleanup"]:
             atexit.register(self.cleanup)
+
+    def connect(self) -> None:
+        """
+        Initialize the servo controller and verify the configured channel is usable.
+
+        Raises
+        ------
+        RuntimeError
+            If the PCA9685 controller cannot be reached or the configured servo
+            channel cannot be configured.
+
+        Examples
+        --------
+        >>> servo = ServoMotor(register_cleanup=False)
+        >>> servo.connect()
+        """
+        if self.connected:
+            self.logger.debug("Servo already connected on channel=%s address=%s", self.channel, self.address)
+            return
+
+        try:
+            self.i2c = self.I2C(self.board.SCL, self.board.SDA)
+            self.kit = self.ServoKit(channels=self.channels, address=self.address, i2c=self.i2c)
+            self.kit.servo[self.channel].set_pulse_width_range(self.pulse_min, self.pulse_max)
+        except Exception as exc:
+            self.kit = None
+            self.i2c = None
+            raise RuntimeError(
+                f"Unable to connect to servo controller at address {hex(self.address)} on channel {self.channel}."
+            ) from exc
+
+        self.connected = True
+        self.logger.info(
+            "Servo motor connected on channel=%s address=%s bus=%s",
+            self.channel,
+            self.address,
+            self.bus,
+        )
 
     def set_angle(self, angle: int, speed: float = 0.0) -> None:
         """
@@ -181,6 +229,9 @@ class ServoMotor(Motor):
         >>> servo.set_angle(30)
         >>> servo.set_angle(60, speed=20.0)
         """
+        if not self.connected or self.kit is None:
+            raise RuntimeError("Servo motor is not connected")
+
         requested_angle = angle
         angle = max(self.min_angle, min(self.max_angle, angle))
         self.logger.debug(
@@ -288,6 +339,7 @@ class ServoMotor(Motor):
             "max_angle": self.max_angle,
             "open_angle": self.open_angle,
             "close_angle": self.close_angle,
+            "connected": self.connected,
         }
 
     def cleanup(self) -> None:
@@ -299,11 +351,18 @@ class ServoMotor(Motor):
         >>> servo = ServoMotor(register_cleanup=False)
         >>> servo.cleanup()
         """
+        if not self.connected or self.kit is None:
+            self.logger.debug("Servo cleanup skipped because motor is not connected")
+            return
         try:
             self.logger.debug("Cleaning up servo channel=%s", self.channel)
             self.kit.servo[self.channel].angle = None
         except Exception:
             self.logger.debug("Servo cleanup failed")
+        finally:
+            self.kit = None
+            self.i2c = None
+            self.connected = False
 
     def _state_from_angle(self, angle: int) -> str:
         """
