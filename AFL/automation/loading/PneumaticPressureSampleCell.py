@@ -267,7 +267,11 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
             raise ValueError('invalid load_mode in config.  cannot load.  valid values are "static" or "ramp"')
         while(self.pctrl.dispenseRunning() and not self.loadStoppedExternally):
             time.sleep(0.02)
-            
+
+        if self.loadStoppedExternally:
+            self.log_info('Load stopped by external stop request.')
+        else:
+            self.log_info(f"Load stopped after reaching load_timeout={self.config['load_timeout']} s.")
         
         self.loadStoppedExternally = False
         self.relayboard.setChannels({'postsample':False})

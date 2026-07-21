@@ -44,6 +44,9 @@ class Driver(DriverWebAppsMixin):
     unqueued = makeRegistrar()
     queued = makeRegistrar()
     quickbar = makeRegistrar()
+    defaults = {
+        'log_level': 'INFO',
+    }
     # Mapping of url subpaths to filesystem directories containing static assets
     # Example: {'docs': '/path/to/docs', 'assets': pathlib.Path(__file__).parent / 'assets'}
     # Files will be served at /static/{subpath}/{filename}
@@ -54,7 +57,7 @@ class Driver(DriverWebAppsMixin):
         self.data = None
         self.dropbox = None
         self.logger = logging.getLogger(name if name is not None else 'Driver')
-        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
         self._tiled_client = None  # Cached Tiled client
         self._combined_dataset_cache = {}
         self._combined_dataset_cache_order = []
@@ -78,11 +81,15 @@ class Driver(DriverWebAppsMixin):
         self.path.mkdir(exist_ok=True,parents=True)
         self.filepath = self.path / (name + '.config.json')
 
+        defaults = dict(self.gather_defaults() if defaults is None else defaults)
+        defaults.setdefault('log_level', 'INFO')
+
         self.config = PersistentConfig(
             path=self.filepath,
             defaults= defaults,
             overrides= overrides,
             )
+        self.configure_logger_level()
         
         # collect inherited static directories
         self.static_dirs = self.gather_static_dirs()
@@ -108,6 +115,30 @@ class Driver(DriverWebAppsMixin):
 
     def log_warning(self, message):
         self._log('warning', message)
+
+    @staticmethod
+    def resolve_log_level(level_name):
+        if isinstance(level_name, int):
+            return level_name
+        normalized = str(level_name).strip().upper()
+        return getattr(logging, normalized, logging.INFO)
+
+    def get_configured_log_level(self):
+        return self.resolve_log_level(self.config.get('log_level', 'INFO'))
+
+    def configure_logger_level(self):
+        level = self.get_configured_log_level()
+        self.logger.setLevel(level)
+
+        if self.app is not None and hasattr(self.app, 'logger'):
+            self.app.logger.setLevel(level)
+            for handler in self.app.logger.handlers:
+                handler.setLevel(level)
+
+        werkzeug_logger = logging.getLogger('werkzeug')
+        werkzeug_logger.setLevel(level)
+        for handler in werkzeug_logger.handlers:
+            handler.setLevel(level)
 
 
     @classmethod
@@ -143,6 +174,8 @@ class Driver(DriverWebAppsMixin):
     
     def set_config(self,**kwargs):
         self.config.update(kwargs)
+        if 'log_level' in kwargs:
+            self.configure_logger_level()
         # if ('driver' in kwargs) and (kwargs['driver'] is not None):
         #     driver_name = kwargs['driver']
         #     del kwargs['driver']

@@ -1,7 +1,10 @@
+import warnings
+
 import pytest
 from AFL.automation.mixcalc.BalanceDiagnosis import BalanceDiagnosis, FailureCode
 from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
 from AFL.automation.mixcalc.Solution import Solution
+from AFL.automation.shared.warnings import MixWarning
 from AFL.automation.shared.units import units
 
 
@@ -323,6 +326,38 @@ def test_upload_stocks_preserves_multi_source_schema_and_list_stocks_reports_rem
             'remaining_volume': '1700.0 ul',
         }
     ]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_process_stocks_keeps_inventory_volume_separate_from_stock_composition():
+    mb = MassBalanceDriver()
+    mb.config.write = False
+    mb.reset_stocks()
+
+    mb.config['stocks'] = [
+        {
+            'name': 'BufferA',
+            'masses': {'H2O': '20 g'},
+            'sources': [
+                {'location': '1A1', 'initial_volume': '100 ul'},
+                {'location': '1A2', 'initial_volume': '100 ul'},
+            ],
+        }
+    ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mb.process_stocks()
+
+    mix_warnings = [warning for warning in caught if issubclass(warning.category, MixWarning)]
+    assert mix_warnings == []
+    assert len(mb.stocks) == 2
+    assert float(mb.stocks[0].volume.to('ml').magnitude) == pytest.approx(20.0)
+    assert float(mb._get_runtime_stock_available_volume(mb.stocks[0]).to('ul').magnitude) == pytest.approx(100.0)
+    assert float(mb._get_runtime_stock_available_volume(mb.stocks[1]).to('ul').magnitude) == pytest.approx(100.0)
+
+    listed = mb.list_stocks()
+    assert listed[0]['remaining_volume'] == '200.0 ul'
 
 
 @pytest.mark.usefixtures("mixdb")

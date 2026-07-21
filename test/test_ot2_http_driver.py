@@ -149,6 +149,47 @@ def _configured_driver():
     return driver
 
 
+def _configured_dual_p20_p300_driver():
+    driver = StubOT2HTTPDriver()
+    driver.hardware_pipettes = {
+        "left": _pipette_info("left", "left-id", min_volume=1, max_volume=20),
+        "right": _pipette_info("right", "right-id", min_volume=30, max_volume=300),
+    }
+    driver.config["loaded_labware"]["1"] = (
+        "tiprack-left",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}, "A3": {}}}},
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_300ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}, "A3": {}}}},
+    )
+    driver.config["loaded_instruments"]["left"] = {
+        "name": "p20_single_gen2",
+        "pipette_id": "left-id",
+        "tip_racks": ["tiprack-left"],
+    }
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p300_single_gen2",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["left"] = [
+        ("tiprack-left", "A1"),
+        ("tiprack-left", "A2"),
+        ("tiprack-left", "A3"),
+    ]
+    driver.config["available_tips"]["right"] = [
+        ("tiprack-right", "A1"),
+        ("tiprack-right", "A2"),
+        ("tiprack-right", "A3"),
+    ]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+    return driver
+
+
 def _custom_labware_def(
     z_value=6.1,
     *,
@@ -254,11 +295,36 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert "moveToAddressableAreaForDropTip" in command_names
     assert "dropTipInPlace" in command_names
     assert driver.last_pipette == "left"
-    assert transfer_result["requested_volume_ul"] == 50.0
-    assert transfer_result["subtransfers_ul"] == [50.0]
+    assert transfer_result["requested_volume_ul"] == 50
+    assert transfer_result["subtransfers_ul"] == [50]
     assert transfer_result["pipette_mount"] == "left"
     assert transfer_result["source"] == "1A1"
     assert transfer_result["dest"] == "1A2"
+
+
+def test_transfer_mix_before_reuses_source_z_offset_for_source_well_commands():
+    driver = _configured_driver()
+
+    driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        mix_before=(2, 10),
+        source_z_offset=1.5,
+    )
+
+    aspirates = [
+        params for command, params in driver.executed_commands if command == "aspirate"
+    ]
+    dispenses = [
+        params for command, params in driver.executed_commands if command == "dispense"
+    ]
+
+    assert aspirates[0]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
+    assert aspirates[1]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
+    assert aspirates[2]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
+    assert dispenses[0]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
+    assert dispenses[1]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
 
 
 def test_transfer_rejects_drop_tip_and_return_tip_together():
@@ -285,6 +351,52 @@ def test_transfer_with_tip_location_uses_requested_tip():
     assert driver.current_tip["well_name"] == "A2"
     assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
     assert transfer_result["requested_tip"]["location"] == "1A2"
+
+
+def test_transfer_with_mount_specific_tip_locations_uses_requested_tip_per_subtransfer():
+    driver = _configured_dual_p20_p300_driver()
+
+    transfer_result = driver.transfer(
+        "1A1",
+        "1A2",
+        320,
+        drop_tip=True,
+        tip_location={"right": "2A2", "left": "1A3"},
+    )
+
+    pick_ups = [params for command, params in driver.executed_commands if command == "pickUpTip"]
+
+    assert transfer_result["subtransfers_ul"] == [300, 20]
+    assert transfer_result["subtransfer_mounts"] == ["right", "left"]
+    assert transfer_result["requested_tips"]["right"]["location"] == "2A2"
+    assert transfer_result["requested_tips"]["left"]["location"] == "1A3"
+    assert [(params["labwareId"], params["wellName"]) for params in pick_ups] == [
+        ("tiprack-right", "A2"),
+        ("tiprack-left", "A3"),
+    ]
+
+
+def test_transfer_uses_supplied_plan_without_replanning():
+    driver = _configured_dual_p20_p300_driver()
+
+    def fail_replan(volume):
+        raise AssertionError(f"unexpected replanning for {volume}")
+
+    driver._plan_transfer_actions = fail_replan
+
+    transfer_result = driver.transfer(
+        "1A1",
+        "1A2",
+        320,
+        drop_tip=True,
+        planned_actions=[
+            {"volume_ul": 300, "pipette": driver.get_pipette(300)},
+            {"volume_ul": 20, "pipette": driver.get_pipette(20)},
+        ],
+    )
+
+    assert transfer_result["subtransfers_ul"] == [300, 20]
+    assert transfer_result["subtransfer_mounts"] == ["right", "left"]
 
 
 def test_pickup_tip_uses_requested_tip_location_and_returns_metadata():
@@ -527,7 +639,7 @@ def test_split_transfer_drops_tip_without_force_new_tip():
     assert command_names.count("pickUpTip") == 1
     assert command_names.count("moveToAddressableAreaForDropTip") == 1
     assert command_names.count("dropTipInPlace") == 1
-    assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
+    assert transfer_result["subtransfers_ul"] == [300, 50]
     assert driver.has_tip is False
     assert driver.current_tip is None
 
@@ -546,9 +658,39 @@ def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():
     assert command_names.count("pickUpTip") == 2
     assert command_names.count("moveToAddressableAreaForDropTip") == 2
     assert command_names.count("dropTipInPlace") == 2
-    assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
+    assert transfer_result["subtransfers_ul"] == [300, 50]
     assert driver.has_tip is False
     assert driver.current_tip is None
+
+
+@pytest.mark.parametrize(
+    ("volume_ul", "expected_subtransfers", "expected_mounts", "expected_pipette_ids"),
+    [
+        (23, [20, 3], ["left", "left"], ["left-id", "left-id"]),
+        (43, [43], ["right"], ["right-id"]),
+        (300, [300], ["right"], ["right-id"]),
+        (301, [300, 1], ["right", "left"], ["right-id", "left-id"]),
+    ],
+)
+def test_transfer_plans_and_executes_expected_pipette_actions(
+    volume_ul,
+    expected_subtransfers,
+    expected_mounts,
+    expected_pipette_ids,
+):
+    driver = _configured_dual_p20_p300_driver()
+
+    transfer_result = driver.transfer("1A1", "1A2", volume_ul, drop_tip=True)
+
+    aspirates = [
+        params for command, params in driver.executed_commands if command == "aspirate"
+    ]
+
+    assert transfer_result["requested_volume_ul"] == volume_ul
+    assert transfer_result["subtransfers_ul"] == expected_subtransfers
+    assert transfer_result["subtransfer_mounts"] == expected_mounts
+    assert [params["volume"] for params in aspirates] == expected_subtransfers
+    assert [params["pipetteId"] for params in aspirates] == expected_pipette_ids
 
 
 def test_drop_tip_to_trash_targets_fixed_trash_before_drop():
@@ -737,6 +879,83 @@ def test_pipette_ranges_ignore_unloaded_mounts():
 
     assert driver.min_largest_pipette == 20
     assert driver.max_smallest_pipette == 300
+
+
+def test_load_instrument_updates_transfer_range_for_newly_loaded_pipette(monkeypatch):
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_labware"]["1"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_300ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-left",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.hardware_pipettes = {
+        "left": _pipette_info("left", "left-id", min_volume=1, max_volume=20),
+        "right": _pipette_info("right", None, min_volume=30, max_volume=300),
+    }
+    driver.config["loaded_instruments"]["left"] = {
+        "name": "p20_single_gen2",
+        "pipette_id": "left-id",
+        "tip_racks": ["tiprack-left"],
+    }
+
+    def fake_update_pipettes():
+        driver.pipette_info = {
+            mount: info.copy() for mount, info in driver.hardware_pipettes.items()
+        }
+        for mount, instrument in driver.config["loaded_instruments"].items():
+            if mount in driver.pipette_info:
+                driver.pipette_info[mount]["id"] = instrument.get("pipette_id")
+        driver.min_transfer = None
+        driver.max_transfer = None
+        for info in driver._get_active_pipettes().values():
+            min_volume = info.get("min_volume")
+            max_volume = info.get("max_volume")
+            if driver.min_transfer is None or driver.min_transfer > min_volume:
+                driver.min_transfer = min_volume
+            if driver.max_transfer is None or driver.max_transfer < max_volume:
+                driver.max_transfer = max_volume
+
+    driver._update_pipettes = fake_update_pipettes
+    driver._update_pipettes()
+    assert driver.max_transfer == 20
+
+    def fake_post(url, headers=None, params=None, json=None):
+        assert json["data"]["commandType"] == "loadPipette"
+        return _FakeResponse({"data": {"result": {"pipetteId": "right-id"}}})
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+
+    driver.load_instrument("p300_single", "right", ["1"])
+
+    assert driver.config["loaded_instruments"]["right"]["pipette_id"] == "right-id"
+    assert driver.max_transfer == 300
+    assert driver.transfer("1A1", "1A2", 100)["subtransfers_ul"] == [100]
+
+
+def test_get_available_wells_returns_sorted_unoccupied_locations():
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_labware"]["5"] = (
+        "plate-5",
+        "custom_plate",
+        {"definition": {"wells": {"B2": {}, "A10": {}, "A2": {}, "A1": {}, "B1": {}}}},
+    )
+    driver.config["occupied_sample_locations"] = ["5A2", "5b1"]
+
+    result = driver.get_available_wells(5)
+
+    assert result == ["5A1", "5A10", "5B2"]
+
+
+def test_get_available_wells_raises_for_missing_slot():
+    driver = StubOT2HTTPDriver()
+
+    with pytest.raises(ValueError, match="No labware loaded in slot 9"):
+        driver.get_available_wells("9")
 
 
 def test_send_labware_deduplicates_identical_content(monkeypatch, tmp_path):
@@ -1107,3 +1326,49 @@ def test_send_labware_persists_to_user_labware_dir(monkeypatch, tmp_path):
 
     assert expected_file.exists()
     assert persisted["wells"]["A1"]["z"] == 6.5
+
+
+def test_set_tempmodule_temperature_holds_before_return(monkeypatch):
+    driver = StubOT2HTTPDriver()
+
+    command_calls = []
+    sleep_calls = []
+    status_reads = iter(
+        [
+            {"currentTemp": 20.0, "targetTemp": 25.0},
+            {"currentTemp": 24.5, "targetTemp": 25.0},
+        ]
+    )
+
+    monkeypatch.setattr(
+        driver,
+        "_execute_atomic_command",
+        lambda command, params, wait_until_complete=True: command_calls.append(
+            (command, params, wait_until_complete)
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "get_tempmodule_status",
+        lambda log=False: next(status_reads),
+    )
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.time.sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+
+    result = driver.set_tempmodule_temperature(
+        module_id="tempdeck-id",
+        temperature_c=25,
+        hold_time=12,
+    )
+
+    assert result == (24.5, 25.0)
+    assert command_calls == [
+        (
+            "temperatureModule/setTargetTemperature",
+            {"moduleId": "tempdeck-id", "celsius": 25.0},
+            True,
+        )
+    ]
+    assert sleep_calls == [5, 12.0]

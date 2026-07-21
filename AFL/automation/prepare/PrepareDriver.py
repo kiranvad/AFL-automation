@@ -307,9 +307,10 @@ class PrepareDriver(MassBalanceDriver):
             if stock.location is None:
                 continue
             available_volume_ul = None
-            if getattr(stock, "volume", None) is not None:
+            available_volume = self._get_runtime_stock_available_volume(stock)
+            if available_volume is not None:
                 try:
-                    available_volume_ul = float(stock.volume.to("ul").magnitude)
+                    available_volume_ul = float(available_volume.to("ul").magnitude)
                 except Exception:
                     available_volume_ul = None
 

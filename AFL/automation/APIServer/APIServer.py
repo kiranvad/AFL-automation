@@ -118,6 +118,8 @@ class APIServer:
         self.driver     = driver
         self.driver.app = self.app
         self.driver.data = self.data
+        self.driver.configure_logger_level()
+        self.init_logging()
         if self.driver.dropbox is None:
             self.driver.dropbox = {}
         self.driver._queue = self.task_queue
@@ -360,7 +362,9 @@ class APIServer:
 
 
     def init_logging(self,toaddrs=None):
-        self.app.logger.setLevel(level=logging.DEBUG)
+        resolved_level = logging.INFO
+        if hasattr(self, 'driver') and self.driver is not None:
+            resolved_level = self.driver.get_configured_log_level()
 
         # SMTP email handling has been removed. The `toaddrs` argument is now
         # ignored and retained only for backwards compatibility.
@@ -370,19 +374,54 @@ class APIServer:
         path = pathlib.Path(resolved_afl_home).expanduser()
         path.mkdir(exist_ok=True,parents=True)
         filepath = path / f'{self.name}.log'
+        formatter = logging.Formatter(
+            '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+        )
+
+        previous_handlers = getattr(self, '_afl_managed_log_handlers', [])
+        for logger_obj, handler in previous_handlers:
+            try:
+                logger_obj.removeHandler(handler)
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+        self.app.logger.handlers.clear()
+        self.app.logger.setLevel(resolved_level)
+        self.app.logger.propagate = False
+
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(resolved_level)
+        stream_handler.setFormatter(formatter)
+
         file_handler = FileHandler(filepath)
-        file_handler.setFormatter(logging.Formatter(
-                '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
-                ))
+        file_handler.setLevel(resolved_level)
+        file_handler.setFormatter(formatter)
+
+        self.app.logger.addHandler(stream_handler)
         self.app.logger.addHandler(file_handler)
-        logging.getLogger('werkzeug').addHandler(file_handler)
+
+        werkzeug_logger = logging.getLogger('werkzeug')
+        werkzeug_logger.setLevel(resolved_level)
+        werkzeug_logger.propagate = False
+        werkzeug_logger.handlers.clear()
+        werkzeug_logger.addHandler(file_handler)
+
+        self._afl_managed_log_handlers = [
+            (self.app.logger, stream_handler),
+            (self.app.logger, file_handler),
+            (werkzeug_logger, file_handler),
+        ]
 
 
     def index(self):
         '''
         Render the legacy status board
         '''
-        self.app.logger.info('Serving index page')
+        self.app.logger.debug('Serving index page')
 
         kw = {}
         kw['queue']        = self.get_queue()
@@ -395,7 +434,7 @@ class APIServer:
         '''
         Render the new driver UI
         '''
-        self.app.logger.info('Serving index page')
+        self.app.logger.debug('Serving index page')
 
         kw = {}
         kw['queue']        = self.get_queue()

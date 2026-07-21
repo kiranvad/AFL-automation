@@ -59,19 +59,20 @@ class StubOT2Prepare(OT2Prepare):
         return {"mount": "left", "name": "p300_single"}
 
     def transfer(self, source, dest, volume, **kwargs):
+        normalized_volume = int(round(float(volume)))
         self.transfer_calls.append(
             {
                 "source": source,
                 "dest": dest,
-                "requested_volume_ul": float(volume),
+                "requested_volume_ul": normalized_volume,
                 "kwargs": dict(kwargs),
             }
         )
         return {
             "source": source,
             "dest": dest,
-            "requested_volume_ul": float(volume),
-            "subtransfers_ul": [float(volume)],
+            "requested_volume_ul": normalized_volume,
+            "subtransfers_ul": [normalized_volume],
             "pipette_mount": "left",
             "pipette_name": "p300_single",
         }
@@ -83,10 +84,10 @@ def test_transfer_stage_records_prepare_execution_metadata():
     driver._transfer_stage(
         source="1A1",
         dest="5A1",
-        volume_ul=50.0,
+        volume_ul=50,
         stage_type="single",
         source_stock_name="Water",
-        planned_transfer={"required_volume_ul": 50.0},
+        planned_transfer={"required_volume_ul": 50},
         extra={"destination_location": "5A1"},
     )
 
@@ -97,10 +98,10 @@ def test_transfer_stage_records_prepare_execution_metadata():
     assert entry["source_location"] == "1A1"
     assert entry["dest_location"] == "5A1"
     assert entry["source_stock_name"] == "Water"
-    assert entry["requested_volume_ul"] == 50.0
+    assert entry["requested_volume_ul"] == 50
     assert entry["transfer_params"]["mix_after"] == [1, 10]
-    assert entry["transfer_result"]["subtransfers_ul"] == [50.0]
-    assert entry["planned_transfer"]["required_volume_ul"] == 50.0
+    assert entry["transfer_result"]["subtransfers_ul"] == [50]
+    assert entry["planned_transfer"]["required_volume_ul"] == 50
 
 
 @pytest.mark.usefixtures("mixdb")
@@ -164,7 +165,7 @@ def test_status_reports_aggregate_stock_inventory_without_source_locations():
 
     status = driver.status()
 
-    assert "Stock inventory remaining: {'Water': '1250.0 uL', 'Salt': '1000.0 uL'}" in status
+    assert "Stock inventory remaining: {'Water': '1250 uL', 'Salt': '1000 uL'}" in status
 
 
 def test_execute_preparation_activates_reservation_after_stock_tip_is_used():
@@ -174,25 +175,120 @@ def test_execute_preparation_activates_reservation_after_stock_tip_is_used():
     ]
     driver.process_stocks()
     balanced_target = SimpleNamespace(
-        protocol=[SimpleNamespace(source="1A1", volume=50.0, tip_location=["1A1", "2A1"])]
+        protocol=[SimpleNamespace(source="1A1", volume=50, tip_location=["1A1", "2A1"])]
     )
 
     success = driver.execute_preparation({}, balanced_target, "5A1")
 
     assert success is True
     assert driver.transfer_calls[0]["kwargs"]["tip_location"] == "1A1"
+    assert driver.transfer_calls[0]["kwargs"]["planned_actions"] == [
+        {"volume_ul": 50, "pipette": {"mount": "left", "name": "p300_single"}}
+    ]
     assert driver.config["stock_tip_reservations"] == {"Water": ["1A1"]}
     assert driver.config["reserved_stock_tips"] == ["1A1"]
 
 
+def test_execute_preparation_selects_mount_specific_stock_tips_for_mixed_mount_plan():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "Water", "masses": {"H2O": "20 g"}, "location": "1A1", "tip": ["1A1", "2A1"]},
+    ]
+    driver.process_stocks()
+    balanced_target = SimpleNamespace(
+        protocol=[SimpleNamespace(source="1A1", volume=320, tip_location=["1A1", "2A1"])]
+    )
+
+    success = driver.execute_preparation({}, balanced_target, "5A1")
+
+    assert success is True
+    assert driver.transfer_calls[0]["kwargs"]["tip_location"] == {"left": "1A1", "right": "2A1"}
+    assert driver.transfer_calls[0]["kwargs"]["planned_actions"] == [
+        {"volume_ul": 300, "pipette": {"mount": "left", "name": "p300_single"}},
+        {"volume_ul": 20, "pipette": {"mount": "right", "name": "p20_single"}},
+    ]
+    assert driver.config["stock_tip_reservations"] == {"Water": ["1A1", "2A1"]}
+    assert driver.config["reserved_stock_tips"] == ["1A1", "2A1"]
+
+
+def test_execute_preparation_computes_transfer_plan_once_per_step():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "Water", "masses": {"H2O": "20 g"}, "location": "1A1", "tip": ["1A1", "2A1"]},
+    ]
+    driver.process_stocks()
+    balanced_target = SimpleNamespace(
+        protocol=[SimpleNamespace(source="1A1", volume=320, tip_location=["1A1", "2A1"])]
+    )
+    calls = []
+
+    def counted_plan(volume):
+        calls.append(volume)
+        return [
+            {"volume_ul": 300, "pipette": {"mount": "left", "name": "p300_single"}},
+            {"volume_ul": 20, "pipette": {"mount": "right", "name": "p20_single"}},
+        ]
+
+    driver._plan_transfer_actions = counted_plan
+
+    success = driver.execute_preparation({}, balanced_target, "5A1")
+
+    assert success is True
+    assert calls == [320]
+
+
 def test_execute_preparation_marks_destination_occupied():
     driver = StubOT2Prepare()
-    balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=50.0)])
+    balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=50)])
 
     success = driver.execute_preparation({}, balanced_target, "5A1")
 
     assert success is True
     assert driver.config["occupied_sample_locations"] == ["5A1"]
+
+
+def test_log_prepare_action_emits_planned_subtransfers_at_info_level(capsys):
+    driver = StubOT2Prepare()
+    driver.get_pipette = lambda volume: (
+        {"mount": "right", "name": "p20_single", "min_volume": 1, "max_volume": 20}
+        if float(volume) < 30
+        else {"mount": "left", "name": "p300_single", "min_volume": 30, "max_volume": 300}
+    )
+
+    driver._log_prepare_action("1A1", "6A1", 23)
+
+    captured = capsys.readouterr()
+    assert "[INFO] Prepare action 1/2: p20_single 1A1 6A1 20 uL" in captured.out
+    assert "[INFO] Prepare action 2/2: p20_single 1A1 6A1 3 uL" in captured.out
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_execute_preparation_raises_runtime_error_when_transfer_overconsumes_inventory():
+    class OverconsumeStubOT2Prepare(StubOT2Prepare):
+        def transfer(self, source, dest, volume, **kwargs):
+            raise ValueError(
+                "Cannot measure out 0.10000000000000003 milliliter from a solution with volume 0.1 milliliter"
+            )
+
+    driver = OverconsumeStubOT2Prepare()
+    driver.config["stocks"] = [
+        {
+            "name": "Water",
+            "masses": {"H2O": "20 g"},
+            "sources": [{"location": "1A1", "initial_volume": "100 ul"}],
+        }
+    ]
+    driver.process_stocks()
+    balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=100.0)])
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"Transfer failed from 1A1 to 5A1: "
+            r"Cannot measure out 0\.10000000000000003 milliliter from a solution with volume 0\.1 milliliter"
+        ),
+    ):
+        driver.execute_preparation({}, balanced_target, "5A1")
 
 
 def test_resolve_destination_rejects_occupied_sample_location():
@@ -271,14 +367,14 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
     assert destination == "6A1"
     assert result["destination"] == "6A1"
     assert result["stock_transfer_volumes_ul"] == {
-        "stock_Red": 300.0,
-        "stock_Blue": 400.0,
-        "stock_Green": 100.0,
-        "stock_Yellow": 200.0,
+        "stock_Red": 300,
+        "stock_Blue": 400,
+        "stock_Green": 100,
+        "stock_Yellow": 200,
     }
     assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
-    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300.0, 400.0, 100.0, 200.0]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300, 400, 100, 200]
 
 
 @pytest.mark.usefixtures("mixdb")
@@ -313,20 +409,20 @@ def test_prepare_stock_volume_fractions_splits_across_multiple_sources_and_track
 
     assert destination == "6A1"
     assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3"]
-    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [700.0, 500.0, 300.0]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [700, 500, 300]
     assert driver.transfer_calls[0]["kwargs"]["tip_location"] == "1A1"
     assert driver.transfer_calls[1]["kwargs"]["tip_location"] == "1A1"
-    assert result["stock_transfer_volumes_ul"] == {"stock_Red": 1200.0, "stock_Blue": 300.0}
+    assert result["stock_transfer_volumes_ul"] == {"stock_Red": 1200, "stock_Blue": 300}
     assert result["stock_inventory_after"]["stock_Red"]["sources"] == [
-        {"stock_id": "stock_Red@1A1", "location": "1A1", "remaining_volume_ul": 0.0, "tip_location": "1A1"},
-        {"stock_id": "stock_Red@1A2", "location": "1A2", "remaining_volume_ul": 500.0, "tip_location": "1A1"},
+        {"stock_id": "stock_Red@1A1", "location": "1A1", "remaining_volume_ul": 0, "tip_location": "1A1"},
+        {"stock_id": "stock_Red@1A2", "location": "1A2", "remaining_volume_ul": 500, "tip_location": "1A1"},
     ]
-    assert driver.get_stock_inventory()["stock_Red"]["remaining_volume_ul"] == pytest.approx(500.0)
+    assert driver.get_stock_inventory()["stock_Red"]["remaining_volume_ul"] == 500
     executed = driver.data["prepare"]["executed_transfers"]
-    assert executed[0]["remaining_before_ul"] == pytest.approx(700.0)
-    assert executed[0]["remaining_after_ul"] == pytest.approx(0.0)
-    assert executed[1]["remaining_before_ul"] == pytest.approx(1000.0)
-    assert executed[1]["remaining_after_ul"] == pytest.approx(500.0)
+    assert executed[0]["remaining_before_ul"] == 700
+    assert executed[0]["remaining_after_ul"] == 0
+    assert executed[1]["remaining_before_ul"] == 1000
+    assert executed[1]["remaining_after_ul"] == 500
 
 
 @pytest.mark.usefixtures("mixdb")
@@ -354,7 +450,7 @@ def test_is_feasible_accepts_stock_volume_fractions_when_large_transfers_can_spl
         "location": "6A1",
         "total_volume": "1000.0 ul",
         "stock_volume_fractions": {"stock_Red": 0.7, "stock_Blue": 0.3},
-        "stock_transfer_volumes_ul": {"stock_Red": 700.0, "stock_Blue": 300.0},
+        "stock_transfer_volumes_ul": {"stock_Red": 700, "stock_Blue": 300},
     }]
 
 
@@ -386,8 +482,8 @@ def test_is_feasible_sets_tiny_stock_volume_fractions_to_zero_below_loaded_pipet
     feasible = driver.is_feasible(target)
 
     assert feasible[0]["stock_transfer_volumes_ul"] == {
-        "stock_Red": 0.0,
-        "stock_Blue": 995.0,
+        "stock_Red": 0,
+        "stock_Blue": 995,
     }
     assert feasible[0]["total_volume"] == "995.0 ul"
     assert feasible[0]["stock_volume_fractions"]["stock_Red"] == pytest.approx(0.0)
@@ -428,7 +524,7 @@ def test_is_feasible_skips_depleted_stock_sources_during_stock_processing():
         "location": "6A1",
         "total_volume": "1000.0 ul",
         "stock_volume_fractions": {"stock_Blue": 1.0},
-        "stock_transfer_volumes_ul": {"stock_Blue": 1000.0},
+        "stock_transfer_volumes_ul": {"stock_Blue": 1000},
     }]
     assert [stock.name for stock in driver.stocks] == ["stock_Blue"]
 
@@ -462,10 +558,10 @@ def test_prepare_sets_tiny_stock_volume_fraction_transfers_to_zero_below_loaded_
 
     assert destination == "6A1"
     assert result["stock_transfer_volumes_ul"] == {
-        "stock_Red": 0.0,
-        "stock_Blue": 995.0,
+        "stock_Red": 0,
+        "stock_Blue": 995,
     }
-    assert result["total_volume"] == "995.0 ul"
+    assert result["total_volume"] == "995 ul"
     assert result["stock_volume_fractions"]["stock_Red"] == pytest.approx(0.0)
     assert result["stock_volume_fractions"]["stock_Blue"] == pytest.approx(1.0)
-    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [995.0]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [995]

@@ -5,6 +5,7 @@ import logging
 import copy
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -43,6 +44,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     >>> driver.load_instrument("p300_single", "left", ["1"])
     >>> driver.transfer("2A1", "3A1", 100)
     """
+
+    @staticmethod
+    def _normalize_transfer_volume_ul(volume) -> int:
+        return int(round(float(volume)))
+
+    @classmethod
+    def _normalize_mix_volume_spec(cls, mix_spec):
+        if mix_spec is None:
+            return None
+        repetitions, volume_ul = mix_spec
+        return int(repetitions), cls._normalize_transfer_volume_ul(volume_ul)
     PIPETTE_NAME_ALIASES = {
         "p10": "p10_single",
         "p10_single": "p10_single",
@@ -933,6 +945,66 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         assert well in self.config["loaded_labware"][slot][2]['definition']['wells'].keys(), f"Well {well} is not a valid well for slot {slot}, {self.config['loaded_labware'][slot][2]['definition']['metadata']['displayName']}"
         
         return wells
+
+    @Driver.unqueued()
+    def get_available_wells(self, slot):
+        """Return unoccupied well locations for the labware loaded in a slot.
+
+        Parameters
+        ----------
+        slot : str or int
+            OT-2 deck slot containing loaded labware.
+
+        Returns
+        -------
+        list of str
+            Deck locations in ``slot+well`` form for wells not listed in
+            ``occupied_sample_locations``.
+
+        Raises
+        ------
+        ValueError
+            If no labware is loaded in the requested slot.
+        """
+        slot = str(slot).strip()
+        loaded_labware = self.config.get("loaded_labware", {})
+
+        if slot not in loaded_labware:
+            raise ValueError(f"No labware loaded in slot {slot}")
+
+        labware_def = loaded_labware[slot][2]["definition"]
+        well_names = list(labware_def.get("wells", {}).keys())
+
+        def well_sort_key(well_name):
+            match = re.fullmatch(r"([A-Za-z]+)(\d+)", str(well_name).strip())
+            if match is None:
+                return (str(well_name), 0)
+            row, col = match.groups()
+            return (row.upper(), int(col))
+
+        normalize_locations = getattr(self, "_normalize_locations", None)
+        occupied_locations = self.config.get("occupied_sample_locations", [])
+        if normalize_locations is not None:
+            occupied = set(normalize_locations(occupied_locations))
+        else:
+            occupied = {
+                str(location).strip().upper()
+                for location in occupied_locations
+                if location is not None
+            }
+
+        available = []
+        for well_name in sorted(well_names, key=well_sort_key):
+            location = f"{slot}{well_name}"
+            normalized_location = (
+                normalize_locations([location])[0]
+                if normalize_locations is not None
+                else location.strip().upper()
+            )
+            if normalized_location not in occupied:
+                available.append(location)
+        return available
+
     def _check_cmd_success(self, response):
         """Raise when an HTTP command response indicates failure.
 
@@ -1397,16 +1469,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             pipette_id = response_data["data"]["result"]["pipetteId"]
 
-            # Make sure we have the latest pipette information (unless disabled for optimization)
-            if update_pipettes:
-                self._update_pipettes()
-            # Ensure pipette_info entry exists before patching
-            if mount not in self.pipette_info:
-                self.pipette_info[mount] = {}
-            self.pipette_info[mount][
-                "id"
-            ] = pipette_id  # patch the correct pipette id to the pipette_info dict
-
             # Get the tip rack IDs - note that loaded_labware now stores tuples of (id, name)
             tip_racks = []
             for slot in listify(tip_rack_slots):
@@ -1427,6 +1489,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "pipette_id": pipette_id,
                 "tip_racks": tip_racks,
             }
+
+            # Refresh pipette metadata only after the instrument is registered as
+            # loaded so active-pipette filtering can include it in transfer
+            # range bookkeeping.
+            if update_pipettes:
+                self._update_pipettes()
+
+            # Ensure pipette_info entry exists before patching
+            if mount not in self.pipette_info:
+                self.pipette_info[mount] = {}
+            self.pipette_info[mount]["id"] = pipette_id
 
             # If not reloading, initialize available tips for this mount
             if not reload:
@@ -1644,6 +1717,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         fast_mixing=False,
         touch_tip=False,
         tip_location=None,
+        planned_actions=None,
         **kwargs,
     ):
         """Transfer liquid between two deck locations.
@@ -1707,6 +1781,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             If ``True``, touch the tip to the destination well after dispense.
         tip_location : str, optional
             Explicit tip location to use, for example ``"1A1"``.
+        planned_actions : list of dict, optional
+            Precomputed pipette subtransfer plan. When provided, execution
+            uses this plan directly instead of recomputing it.
         **kwargs
             Additional compatibility aliases such as ``blowout`` and
             ``touchTip``.
@@ -1736,8 +1813,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         ...     tip_rack_offset={"x": 0, "y": 0, "z": -1},
         ... )
         """
-        self.log_info(f"Transferring {volume}uL from {source} to {dest}")
-
         if drop_tip and return_tip:
             raise ValueError("Only one of drop_tip and return_tip can be True")
 
@@ -1746,7 +1821,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if "touchTip" in kwargs and not touch_tip:
             touch_tip = bool(kwargs["touchTip"])
 
-        volume_ul = float(volume)
+        volume_ul = self._normalize_transfer_volume_ul(volume)
+        air_gap_ul = self._normalize_transfer_volume_ul(air_gap)
+        mix_before = self._normalize_mix_volume_spec(mix_before)
+        mix_after = self._normalize_mix_volume_spec(mix_after)
+        self.log_info(f"Transferring {volume_ul}uL from {source} to {dest}")
         if volume_ul <= 0:
             self.log_info(f"Skipping transfer with nonpositive volume {volume_ul}uL from {source} to {dest}")
             return {
@@ -1765,39 +1844,26 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if dispense_rate is not None:
             self.set_dispense_rate(dispense_rate)
 
-        pipette = self.get_pipette(volume_ul)
-        pipette_mount = pipette["mount"]
+        if planned_actions is None:
+            planned_actions = self._plan_transfer_actions(volume_ul)
+        if not planned_actions:
+            raise ValueError(f"Could not build a transfer plan for {volume_ul} uL")
+        first_action = planned_actions[0]
+        first_pipette = first_action["pipette"]
         resolve_tip_rack_offset = getattr(self, "_resolve_tip_rack_offset", None)
         if resolve_tip_rack_offset is not None:
-            resolved_tip_rack_offset = resolve_tip_rack_offset(
+            initial_tip_rack_offset = resolve_tip_rack_offset(
                 tip_rack_offset,
-                mount=pipette_mount,
+                mount=first_pipette["mount"],
             )
         elif tip_rack_offset is None:
-            resolved_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
+            initial_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
         else:
-            resolved_tip_rack_offset = dict(tip_rack_offset)
-        requested_tip = None
-        if tip_location is not None:
-            tip_location_str = str(tip_location).strip().upper()
-            resolve_tip_location = getattr(self, "_resolve_tip_location", None)
-            if resolve_tip_location is not None:
-                requested_tip = resolve_tip_location(pipette_mount, tip_location_str)
-            else:
-                requested_tip = {
-                    "labware_id": self.config["loaded_labware"][str(tip_location_str[0])][0],
-                    "well_name": tip_location_str[1:],
-                }
-            requested_tip["location"] = tip_location_str
-
-        pipette_id = None
-        for mount, data in self.pipette_info.items():
-            if mount == pipette_mount and data:
-                pipette_id = data.get("id")
-                break
-
-        if not pipette_id:
-            raise ValueError(f"Could not find ID for pipette on {pipette_mount} mount")
+            initial_tip_rack_offset = dict(tip_rack_offset)
+        requested_tips = self._resolve_requested_tips_for_plan(
+            tip_location,
+            planned_actions,
+        )
 
         source_wells = self.get_wells(source)
         if len(source_wells) > 1:
@@ -1819,20 +1885,16 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         elif to_center:
             dest_position = "center"
 
-        split_up_transfers = getattr(self, "_split_up_transfers", None)
-        if split_up_transfers is not None:
-            transfers = split_up_transfers(volume_ul)
-        else:
-            transfers = [volume_ul]
         transfer_record = {
             "source": source,
             "dest": dest,
             "requested_volume_ul": volume_ul,
             "subtransfers_ul": [],
+            "subtransfer_mounts": [],
             "subtransfer_count": 0,
-            "pipette_mount": pipette_mount,
-            "pipette_name": pipette.get("name"),
-            "pipette_id": pipette_id,
+            "pipette_mount": first_pipette["mount"],
+            "pipette_name": first_pipette.get("name"),
+            "pipette_id": first_pipette.get("pipette_id"),
             "source_well": {
                 "labware_id": source_well["labwareId"],
                 "well_name": source_well["wellName"],
@@ -1847,7 +1909,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "options": {
                 "mix_before": list(mix_before) if mix_before is not None else None,
                 "mix_after": list(mix_after) if mix_after is not None else None,
-                "air_gap": air_gap,
+                "air_gap": air_gap_ul,
                 "aspirate_rate": aspirate_rate,
                 "dispense_rate": dispense_rate,
                 "mix_aspirate_rate": mix_aspirate_rate,
@@ -1862,28 +1924,51 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "to_top": to_top,
                 "to_center": to_center,
                 "to_top_z_offset": to_top_z_offset,
-                "tip_rack_offset": dict(resolved_tip_rack_offset),
+                "tip_rack_offset": dict(initial_tip_rack_offset),
                 "fast_mixing": fast_mixing,
                 "touch_tip": touch_tip,
                 "tip_location": tip_location,
             },
             "status": "executed",
         }
-        if requested_tip is not None:
-            transfer_record["requested_tip"] = requested_tip.copy()
+        if len(requested_tips) == 1:
+            transfer_record["requested_tip"] = next(iter(requested_tips.values())).copy()
+        elif requested_tips:
+            transfer_record["requested_tips"] = {
+                mount: requested_tip.copy() for mount, requested_tip in requested_tips.items()
+            }
 
-        for i, sub_volume in enumerate(transfers):
+        for i, action in enumerate(planned_actions):
+            pipette = action["pipette"]
+            pipette_mount = pipette["mount"]
+            requested_tip = requested_tips.get(pipette_mount)
+            pipette_id = pipette.get("pipette_id")
+            if not pipette_id:
+                pipette_id = self.pipette_info.get(pipette_mount, {}).get("id")
+            if not pipette_id:
+                raise ValueError(f"Could not find ID for pipette on {pipette_mount} mount")
+            if resolve_tip_rack_offset is not None:
+                resolved_tip_rack_offset = resolve_tip_rack_offset(
+                    tip_rack_offset,
+                    mount=pipette_mount,
+                )
+            elif tip_rack_offset is None:
+                resolved_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
+            else:
+                resolved_tip_rack_offset = dict(tip_rack_offset)
+            sub_volume = action["volume_ul"]
             if sub_volume <= 0:
                 self.log_warning(
                     f"Skipping nonpositive sub-transfer volume {sub_volume}uL from {source} to {dest}"
                 )
                 continue
-            transfer_record["subtransfers_ul"].append(float(sub_volume))
+            transfer_record["subtransfers_ul"].append(int(sub_volume))
+            transfer_record["subtransfer_mounts"].append(pipette_mount)
 
             # Final tip disposal is controlled by drop_tip / return_tip alone.
             # force_new_tip only controls whether a used tip is cleared before
             # the next subtransfer picks up a fresh one.
-            is_last_subtransfer = i == (len(transfers) - 1)
+            is_last_subtransfer = i == (len(planned_actions) - 1)
             effective_drop_tip = bool(drop_tip and is_last_subtransfer)
             effective_return_tip = bool(return_tip and is_last_subtransfer)
 
@@ -2017,7 +2102,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                             "wellName": source_well["wellName"],
                             "wellLocation": {
                                 "origin": source_position,
-                                "offset": {"x": 0, "y": 0, "z": 0},
+                                "offset": {"x": 0, "y": 0, "z": source_z_offset},
                             },
                             "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
                         },
@@ -2033,7 +2118,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                             "wellName": source_well["wellName"],
                             "wellLocation": {
                                 "origin": source_position,
-                                "offset": {"x": 0, "y": 0, "z": 0},
+                                "offset": {"x": 0, "y": 0, "z": source_z_offset},
                             },
                             "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
                         },
@@ -2089,13 +2174,13 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # self._execute_atomic_command("delay", {"seconds": post_aspirate_delay})
 
             # 6. Air gap if specified
-            if air_gap > 0: 
+            if air_gap_ul > 0:
                 # Air gap is implemented as aspirate at the top of the source well
                 self._execute_atomic_command(
                     "aspirate",
                     {
                         "pipetteId": pipette_id,
-                        "volume": air_gap,
+                        "volume": air_gap_ul,
                         "labwareId": source_well["labwareId"],
                         "wellName": source_well["wellName"],
                         "wellLocation": {
@@ -2123,7 +2208,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 {
                     "pipetteId": pipette_id,
                     "volume": sub_volume
-                    + air_gap,  # Include air gap in dispense volume
+                    + air_gap_ul,  # Include air gap in dispense volume
                     "labwareId": dest_well["labwareId"],
                     "wellName": dest_well["wellName"],
                     "wellLocation": {"origin": dest_position, "offset": offset},
@@ -2245,19 +2330,118 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         list of float
             One or more subtransfer volumes.
         """
-        volume_ul = float(volume)
+        return [action["volume_ul"] for action in self._plan_transfer_actions(volume)]
+
+    def _resolve_requested_tips_for_plan(self, tip_location, planned_actions):
+        """Resolve requested tip locations for the mounts used in a transfer plan."""
+        if tip_location is None:
+            return {}
+
+        resolve_tip_mount = getattr(self, "_resolve_tip_mount", None)
+        if resolve_tip_mount is None:
+            return {}
+
+        required_mounts = []
+        for action in planned_actions:
+            mount = action["pipette"]["mount"]
+            if mount not in required_mounts:
+                required_mounts.append(mount)
+
+        if isinstance(tip_location, dict):
+            requested_tips = {}
+            for mount, location in tip_location.items():
+                if location is None:
+                    continue
+                normalized_mount = str(mount).strip().lower()
+                requested_tip = resolve_tip_mount(str(location).strip().upper())
+                if requested_tip["mount"] != normalized_mount:
+                    raise ValueError(
+                        f"Requested tip location {requested_tip['tip_location']} is only valid for mount "
+                        f"{requested_tip['mount']}, not {normalized_mount}"
+                    )
+                requested_tip["location"] = requested_tip["tip_location"]
+                requested_tips[normalized_mount] = requested_tip
+            return requested_tips
+
+        tip_location_str = str(tip_location).strip().upper()
+        requested_tip = resolve_tip_mount(tip_location_str)
+        requested_tip["location"] = tip_location_str
+        incompatible_mounts = sorted(
+            mount for mount in required_mounts if mount != requested_tip["mount"]
+        )
+        if incompatible_mounts:
+            raise ValueError(
+                f"Requested tip location {tip_location_str} is only valid for mount "
+                f"{requested_tip['mount']}, but transfer plan also requires mounts "
+                f"{', '.join(incompatible_mounts)}"
+            )
+        return {requested_tip["mount"]: requested_tip}
+
+    def _can_service_transfer_volume(self, volume_ul):
+        """Return whether any loaded pipette can execute a transfer volume."""
+        try:
+            self.get_pipette(self._normalize_transfer_volume_ul(volume_ul))
+        except ValueError:
+            return False
+        return True
+
+    def _planning_bounds_for_pipette(self, pipette):
+        """Return normalized min/max transfer bounds for a pipette."""
+        min_volume = pipette.get("min_volume")
+        infer_min_volume = getattr(self, "_infer_pipette_min_volume", None)
+        if min_volume is None and infer_min_volume is not None:
+            min_volume = infer_min_volume(pipette.get("name"))
+        if min_volume is None:
+            min_volume = 1
+
+        max_volume = pipette.get("max_volume")
+        if max_volume is None:
+            pipette_label = str(pipette.get("name") or pipette.get("model") or "").lower()
+            match = re.search(r"p(\d+)", pipette_label)
+            if match is not None:
+                max_volume = int(match.group(1))
+        if max_volume is None:
+            max_volume = min_volume
+
+        return (
+            self._normalize_transfer_volume_ul(min_volume),
+            self._normalize_transfer_volume_ul(max_volume),
+        )
+
+    def _plan_transfer_actions(self, volume):
+        """Plan executable subtransfers with explicit pipette assignments."""
+        volume_ul = self._normalize_transfer_volume_ul(volume)
         if volume_ul <= 0:
             return []
-        if self.max_transfer is None or volume_ul <= self.max_transfer:
-            return [volume_ul]
 
-        transfers = []
+        planned_actions = []
         remaining = volume_ul
         while remaining > 0:
-            sub_volume = min(self.max_transfer, remaining)
-            transfers.append(float(sub_volume))
-            remaining -= sub_volume
-        return transfers
+            pipette = self.get_pipette(remaining)
+            min_volume, max_volume = self._planning_bounds_for_pipette(pipette)
+            max_chunk = min(remaining, max_volume)
+            chosen_chunk = None
+
+            for chunk in range(max_chunk, min_volume - 1, -1):
+                remainder = remaining - chunk
+                if remainder == 0 or self._can_service_transfer_volume(remainder):
+                    chosen_chunk = chunk
+                    break
+
+            if chosen_chunk is None:
+                raise ValueError(
+                    f"Cannot split {volume_ul} uL into executable subtransfers with loaded pipettes"
+                )
+
+            planned_actions.append(
+                {
+                    "volume_ul": int(chosen_chunk),
+                    "pipette": pipette.copy(),
+                }
+            )
+            remaining -= chosen_chunk
+
+        return planned_actions
 
     def _resolve_tip_rack_offset(self, tip_rack_offset=None, mount=None):
         """Resolve the configured tip-rack offset mapping.
@@ -2816,7 +3000,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         self.log_info(f"Setting gantry speed to {speed} mm/s")
 
-    def get_pipette(self, volume, method="min_transfers"):
+    def get_pipette(self, volume, method="min_transfers", refresh=False):
         """Select the best loaded pipette for a requested volume.
 
         Parameters
@@ -2825,6 +3009,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             Requested transfer volume in microliters.
         method : {"min_transfers", "uncertainty"}, default="min_transfers"
             Selection strategy.
+        refresh : bool, default=False
+            If ``True``, refresh pipette information from the robot before
+            selecting. Otherwise cached pipette information is used unless the
+            cache is empty.
 
         Returns
         -------
@@ -2833,8 +3021,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             of required transfers.
         """
         self.log_debug(f"Looking for a pipette for volume {volume}")
-        # Make sure we have the latest pipette information
-        self._update_pipettes()
+        # Refresh from the robot only when explicitly requested or when no
+        # cached pipette information is available yet.
+        if refresh or not self.pipette_info:
+            self._update_pipettes()
 
         pipettes = []
         for mount, pipette_data in self._get_active_pipettes().items():
@@ -3123,6 +3313,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         module_id,
         temperature_c,
         wait = True,
+        hold_time=0,
         ):
         """Set a temperature module target and optionally wait to stabilize.
 
@@ -3140,12 +3331,18 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             wait_until_complete=wait,
         )
         data = self.get_tempmodule_status(log=False)
-        while abs(data.get("currentTemp")-data.get("targetTemp")) > 1.0:
+        while abs(data.get("currentTemp")-data.get("targetTemp")) > 0.5:
             time.sleep(5)
             data = self.get_tempmodule_status(log=False)
             self.log_debug(f"Waiting for temperature to stabilize... "
                             f"(Current: {data.get('currentTemp')}°C, Target: {data.get('targetTemp')}°C)")
 
+        hold_time = float(hold_time)
+        if hold_time > 0:
+            self.log_debug(f"Holding temperature module for {hold_time} seconds before returning")
+            time.sleep(hold_time)
+
+        data = self.get_tempmodule_status(log=False)
         return data.get("currentTemp"), data.get("targetTemp")
 
     def deactivate_tempmodule(self, module_id, timeout_s=120, wait=True):

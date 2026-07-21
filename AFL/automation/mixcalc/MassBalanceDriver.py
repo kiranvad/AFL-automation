@@ -409,6 +409,20 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
         self.config['stock_inventory'] = inventory
         return normalized_stocks
 
+    @staticmethod
+    def _normalize_runtime_stock_available_volume(volume):
+        if volume is None:
+            return None
+        return enforce_units(volume, 'volume')
+
+    @classmethod
+    def _set_runtime_stock_available_volume(cls, stock: Solution, volume) -> None:
+        stock.available_volume = cls._normalize_runtime_stock_available_volume(volume)
+
+    @staticmethod
+    def _get_runtime_stock_available_volume(stock: Solution):
+        return getattr(stock, 'available_volume', None)
+
     def _runtime_stock_configs(self, stock_config: Dict) -> List[Dict]:
         runtime_configs = []
         base = copy.deepcopy(stock_config)
@@ -430,7 +444,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
                 remaining_volume_qty = enforce_units(remaining_volume, 'volume')
                 if float(remaining_volume_qty.to('ul').magnitude) <= 0:
                     continue
-                runtime_config['total_volume'] = remaining_volume
+                runtime_config['_available_volume'] = remaining_volume
             runtime_configs.append(runtime_config)
         return runtime_configs
 
@@ -451,12 +465,14 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
                     source_locations[0] if len(source_locations) == 1 else source_locations
                 )
             for runtime_config in self._runtime_stock_configs(stock_config):
+                available_volume = runtime_config.pop('_available_volume', None)
                 if capture_diagnostics:
                     stock, diag = self._build_solution_with_diagnostics(runtime_config, idx)
                     if diag:
                         diagnostics.append(diag)
                 else:
                     stock = Solution(**runtime_config)
+                self._set_runtime_stock_available_volume(stock, available_volume)
                 stock.stock_group = stock_config['name']
                 stock.stock_id = (
                     self._make_stock_source_id(stock_config['name'], stock.location)
@@ -465,9 +481,15 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
                 )
                 new_stocks.append(stock)
                 inventory_entry = self.config.get('stock_inventory', {}).get(stock.stock_id, {})
-                if stock.stock_id is not None and inventory_entry.get('remaining_volume') is None and stock.volume is not None:
+                if (
+                    stock.stock_id is not None
+                    and inventory_entry.get('remaining_volume') is None
+                    and self._get_runtime_stock_available_volume(stock) is not None
+                ):
                     self.config['stock_inventory'][stock.stock_id] = {
-                        'remaining_volume': f"{float(stock.volume.to('ul').magnitude)} ul"
+                        'remaining_volume': (
+                            f"{float(self._get_runtime_stock_available_volume(stock).to('ul').magnitude)} ul"
+                        )
                     }
         if 'stock_locations' in self.config:
             self.config['stock_locations'] = stock_locations

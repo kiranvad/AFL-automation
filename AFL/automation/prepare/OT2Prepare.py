@@ -115,11 +115,21 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
 
     def _validate_pipette_action_plan(self, protocol):
         """Validate planned transfer volumes against loaded OT-2 pipettes."""
+        plan_transfer_actions = getattr(self, "_plan_transfer_actions", None)
         split_up_transfers = getattr(self, "_split_up_transfers", None)
         can_split = split_up_transfers is not None and hasattr(self, "max_transfer")
         for action in protocol:
-            volume_ul = float(action.volume)
+            volume_ul = self._normalize_transfer_volume_ul(action.volume)
             if volume_ul <= 0:
+                continue
+            if plan_transfer_actions is not None:
+                try:
+                    plan_transfer_actions(volume_ul)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Planned transfer from {action.source} to {action.dest} with volume "
+                        f"{volume_ul} uL is not executable with the loaded pipettes: {exc}"
+                    ) from exc
                 continue
             subtransfers = [volume_ul]
             if can_split:
@@ -202,9 +212,9 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
 
     def _closest_feasible_transfer_volume(self, requested_volume_ul):
         """Return the nearest OT-2-executable transfer volume for a request."""
-        requested_volume_ul = float(requested_volume_ul)
+        requested_volume_ul = self._normalize_transfer_volume_ul(requested_volume_ul)
         if requested_volume_ul <= 0:
-            return 0.0
+            return 0
 
         try:
             self.get_pipette(requested_volume_ul)
@@ -223,7 +233,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if candidate_minima:
             nearest_positive_volume_ul = candidate_minima[0]
             if requested_volume_ul < (nearest_positive_volume_ul / 2.0):
-                return 0.0
+                return 0
 
         for candidate_volume_ul in candidate_minima:
             if candidate_volume_ul < requested_volume_ul:
@@ -245,11 +255,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         adjusted_any_transfer = False
 
         for action in direct_target.protocol:
-            adjusted_volume_ul = round(
-                self._closest_feasible_transfer_volume(action.volume),
-                6,
+            adjusted_volume_ul = self._normalize_transfer_volume_ul(
+                self._closest_feasible_transfer_volume(action.volume)
             )
-            if abs(adjusted_volume_ul - float(action.volume)) > 1e-9:
+            if adjusted_volume_ul != self._normalize_transfer_volume_ul(action.volume):
                 adjusted_any_transfer = True
 
             adjusted_action = action
@@ -262,7 +271,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if not adjusted_any_transfer:
             return direct_target
 
-        actual_total_volume_ul = round(sum(adjusted_transfer_volumes.values()), 6)
+        actual_total_volume_ul = sum(adjusted_transfer_volumes.values())
         if actual_total_volume_ul <= 0:
             raise ValueError("Adjusted stock-fraction target has no executable transfer volume")
 
@@ -394,14 +403,17 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         for group_name, sources in grouped_sources.items():
             if requested_name is not None and group_name != requested_name:
                 continue
-            total_remaining_ul = 0.0
+            total_remaining_ul = 0
             total_known = False
             source_entries = []
             for source in sources:
                 remaining_ul = None
-                if getattr(source, "volume", None) is not None:
+                available_volume = self._get_runtime_stock_available_volume(source)
+                if available_volume is not None:
                     try:
-                        remaining_ul = round(float(source.volume.to("ul").magnitude), 6)
+                        remaining_ul = self._normalize_transfer_volume_ul(
+                            available_volume.to("ul").magnitude
+                        )
                     except Exception:
                         remaining_ul = None
                 if remaining_ul is not None:
@@ -417,7 +429,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                         }
                     )
             entry = {
-                "remaining_volume_ul": round(total_remaining_ul, 6) if total_known else None,
+                "remaining_volume_ul": int(total_remaining_ul) if total_known else None,
             }
             if include_sources:
                 entry["sources"] = source_entries
@@ -434,14 +446,25 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 "source_stock_group": self.config.get("deck", {}).get(source_location),
                 "remaining_before_ul": None,
                 "remaining_after_ul": None,
-                "consumed_volume_ul": round(float(consumed_volume_ul), 6),
+                "consumed_volume_ul": self._normalize_transfer_volume_ul(consumed_volume_ul),
             }
         before_ul = None
         after_ul = None
-        if getattr(stock, "volume", None) is not None:
-            before_ul = round(float(stock.volume.to("ul").magnitude), 6)
-            stock.measure_out(f"{float(consumed_volume_ul)} ul", deplete=True)
-            after_ul = round(float(stock.volume.to("ul").magnitude), 6)
+        available_volume = self._get_runtime_stock_available_volume(stock)
+        if available_volume is not None:
+            consumed_volume_ul = self._normalize_transfer_volume_ul(consumed_volume_ul)
+            before_ul = self._normalize_transfer_volume_ul(available_volume.to("ul").magnitude)
+            consumed_qty = enforce_units(f"{consumed_volume_ul} ul", "volume")
+            remaining_qty = available_volume - consumed_qty
+            after_ul = self._normalize_transfer_volume_ul(remaining_qty.to("ul").magnitude)
+            if after_ul < 0:
+                raise ValueError(
+                    f"Cannot consume {consumed_volume_ul} uL from stock source {source_location} "
+                    f"with {before_ul} uL remaining."
+                )
+            if after_ul == 0:
+                remaining_qty = enforce_units("0 ul", "volume")
+            self._set_runtime_stock_available_volume(stock, remaining_qty)
             inventory = dict(self.config.get("stock_inventory", {}))
             inventory[getattr(stock, "stock_id", f"{stock.name}@{stock.location}")] = {
                 "remaining_volume": f"{after_ul} ul"
@@ -452,7 +475,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             "source_stock_group": getattr(stock, "stock_group", stock.name),
             "remaining_before_ul": before_ul,
             "remaining_after_ul": after_ul,
-            "consumed_volume_ul": round(float(consumed_volume_ul), 6),
+            "consumed_volume_ul": self._normalize_transfer_volume_ul(consumed_volume_ul),
         }
 
     def _ordered_stock_tip_candidates(self, stock_name, step_tip_location=None):
@@ -489,8 +512,14 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 ordered.append(normalized)
         return ordered
 
-    def _select_stock_tip_location(self, stock_name, volume_ul, step_tip_location=None):
-        """Choose an available stock-reserved tip location.
+    def _select_stock_tip_location(
+        self,
+        stock_name,
+        volume_ul,
+        step_tip_location=None,
+        planned_actions=None,
+    ):
+        """Choose available stock-reserved tip locations for a transfer plan.
 
         Parameters
         ----------
@@ -500,12 +529,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             Transfer volume used to determine the pipette mount.
         step_tip_location : str or sequence of str, optional
             Explicit tip location override from the planned transfer step.
+        planned_actions : list of dict, optional
+            Precomputed pipette subtransfer plan for this transfer.
 
         Returns
         -------
-        str or None
-            Selected normalized tip location, or ``None`` when no stock tip is
-            configured.
+        str, dict, or None
+            Selected normalized tip location for a single-mount transfer, a
+            mount-to-tip mapping for a mixed-mount plan, or ``None`` when no
+            stock tip is configured.
 
         Raises
         ------
@@ -522,47 +554,59 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if not candidates:
             return None
 
-        pipette_mount = self.get_pipette(float(volume_ul))["mount"]
-        match_tip_location = getattr(self, "_tip_location_matches_mount", None)
-        resolve_tip_location = getattr(self, "_resolve_tip_location", None)
-        compatible = []
-        for location in candidates:
-            if match_tip_location is not None:
-                try:
-                    matches_mount = match_tip_location(pipette_mount, location)
-                except ValueError:
-                    continue
-                if not matches_mount:
-                    continue
-            compatible.append(location)
-            if resolve_tip_location is None:
-                return location
-            try:
-                resolve_tip_location(pipette_mount, location)
-                return location
-            except ValueError:
-                continue
+        volume_ul = self._normalize_transfer_volume_ul(volume_ul)
+        plan_transfer_actions = getattr(self, "_plan_transfer_actions", None)
+        if planned_actions is None:
+            if plan_transfer_actions is not None:
+                planned_actions = plan_transfer_actions(volume_ul)
+            else:
+                planned_actions = [{"pipette": self.get_pipette(volume_ul)}]
+        if not planned_actions:
+            planned_actions = [{"pipette": self.get_pipette(volume_ul)}]
 
-        if compatible:
+        required_mounts = []
+        for action in planned_actions:
+            mount = action["pipette"]["mount"]
+            if mount not in required_mounts:
+                required_mounts.append(mount)
+
+        resolve_tip_location = getattr(self, "_resolve_tip_location", None)
+        selected_by_mount = {}
+        used_locations = set()
+        for pipette_mount in required_mounts:
+            for location in candidates:
+                if location in used_locations:
+                    continue
+                if resolve_tip_location is not None:
+                    try:
+                        resolve_tip_location(pipette_mount, location)
+                    except ValueError:
+                        continue
+                selected_by_mount[pipette_mount] = location
+                used_locations.add(location)
+                break
+
+            if pipette_mount in selected_by_mount:
+                continue
             raise ValueError(
-                f"No configured tip locations for stock '{stock_name}' are currently available "
-                f"on {pipette_mount} mount: {', '.join(compatible)}"
+                f"No configured tip locations for stock '{stock_name}' match the {pipette_mount} mount: "
+                f"{', '.join(candidates)}"
             )
-        raise ValueError(
-            f"No configured tip locations for stock '{stock_name}' match the {pipette_mount} mount: "
-            f"{', '.join(candidates)}"
-        )
+
+        if len(selected_by_mount) == 1:
+            return next(iter(selected_by_mount.values()))
+        return selected_by_mount
 
     def _activate_stock_tip_reservation(self, stock_name, tip_location):
-        """Mark a stock tip as actively reserved.
+        """Mark stock tips as actively reserved.
 
         Parameters
         ----------
         stock_name : str
             Stock identifier.
-        tip_location : str or None
-            Tip location to reserve. ``None`` leaves the reservation state
-            unchanged.
+        tip_location : str, sequence, dict, or None
+            Tip location or locations to reserve. ``None`` leaves the
+            reservation state unchanged.
 
         Examples
         --------
@@ -571,25 +615,35 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if stock_name is None or tip_location is None:
             return
 
-        tip_location = self._normalize_locations([tip_location])[0]
-        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
-        if tip_location not in configured:
-            return
-
         reservations = {
             name: self._normalize_locations(listify(locations))
             for name, locations in self.config.get("stock_tip_reservations", {}).items()
         }
-        for other_stock, locations in reservations.items():
-            if other_stock != stock_name and tip_location in locations:
-                raise ValueError(
-                    f"Tip location {tip_location} is already reserved for stock '{other_stock}' "
-                    f"and cannot also be reserved for stock '{stock_name}'."
-                )
+        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
+        if isinstance(tip_location, dict):
+            locations_to_reserve = list(tip_location.values())
+        else:
+            locations_to_reserve = listify(tip_location)
+        normalized_locations = [
+            location
+            for location in self._normalize_locations(locations_to_reserve)
+            if location in configured
+        ]
+        if not normalized_locations:
+            return
+
+        for location in normalized_locations:
+            for other_stock, locations in reservations.items():
+                if other_stock != stock_name and location in locations:
+                    raise ValueError(
+                        f"Tip location {location} is already reserved for stock '{other_stock}' "
+                        f"and cannot also be reserved for stock '{stock_name}'."
+                    )
 
         stock_reservations = reservations.get(stock_name, [])
-        if tip_location not in stock_reservations:
-            stock_reservations.append(tip_location)
+        for location in normalized_locations:
+            if location not in stock_reservations:
+                stock_reservations.append(location)
         reservations[stock_name] = self._normalize_locations(stock_reservations)
 
         active_reserved = []
@@ -599,7 +653,13 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         self.config["stock_tip_reservations"] = reservations
         self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
 
-    def _build_stock_transfer_params(self, stock_name, volume_ul, step_tip_location=None):
+    def _build_stock_transfer_params(
+        self,
+        stock_name,
+        volume_ul,
+        step_tip_location=None,
+        planned_actions=None,
+    ):
         """Build transfer keyword arguments for a stock step.
 
         Parameters
@@ -610,6 +670,8 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             Requested transfer volume in microliters.
         step_tip_location : str or sequence of str, optional
             Explicit tip location override from the protocol step.
+        planned_actions : list of dict, optional
+            Precomputed pipette subtransfer plan for this transfer.
 
         Returns
         -------
@@ -627,9 +689,12 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             stock_name=stock_name,
             volume_ul=volume_ul,
             step_tip_location=step_tip_location,
+            planned_actions=planned_actions,
         )
         if selected_tip_location is not None:
             transfer_params["tip_location"] = selected_tip_location
+        if planned_actions is not None:
+            transfer_params["planned_actions"] = [dict(action) for action in planned_actions]
         return transfer_params, selected_tip_location
 
     def _occupied_sample_locations(self):
@@ -865,19 +930,27 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         protocol = self.reorder_protocol(balanced_target.protocol)
         for step in protocol:
             source = step.source
-            volume_ul = step.volume
-            if float(volume_ul) <= 0:
+            volume_ul = self._normalize_transfer_volume_ul(step.volume)
+            if volume_ul <= 0:
                 continue
             stock_name = self.config.get("deck", {}).get(source)
             if stock_name is None:
                 raise ValueError(f"No stock name found for deck location: {source}")
+            planned_actions = self._plan_transfer_actions(volume_ul)
 
             transfer_params, selected_tip_location = self._build_stock_transfer_params(
                 stock_name=stock_name,
                 volume_ul=volume_ul,
                 step_tip_location=getattr(step, "tip_location", None),
+                planned_actions=planned_actions,
             )
             try:
+                self._log_prepare_action(
+                    source,
+                    destination,
+                    volume_ul,
+                    planned_actions=planned_actions,
+                )
                 transfer_result = self.transfer(
                     source=source,
                     dest=destination,
@@ -886,13 +959,13 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 )
                 depletion_info = self._consume_stock_volume(
                     source,
-                    sum(transfer_result.get("subtransfers_ul", [])) or float(volume_ul),
+                    sum(transfer_result.get("subtransfers_ul", [])) or volume_ul,
                 )
                 self._record_prepare_transfer(
                     stage_type="single",
                     source=source,
                     dest=destination,
-                    requested_volume_ul=float(volume_ul),
+                    requested_volume_ul=volume_ul,
                     source_stock_name=stock_name,
                     transfer_params=transfer_params,
                     transfer_result=transfer_result,
@@ -905,8 +978,9 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 )
                 self._activate_stock_tip_reservation(stock_name, selected_tip_location)
             except Exception as e:
-                warnings.warn(f"Transfer failed from {source} to {destination}: {str(e)}", stacklevel=2)
-                return False
+                raise RuntimeError(
+                    f"Transfer failed from {source} to {destination}: {str(e)}"
+                ) from e
 
         self.last_target_location = destination
         self._mark_sample_locations_occupied([destination])
@@ -938,6 +1012,32 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 raise ValueError(f"Unknown intermediate source token: {source_location}")
             return intermediate_map[key]
         return source_location
+
+    def _log_prepare_action(self, source, dest, volume_ul, planned_actions=None):
+        """Log planned pipette actions for one prepare transfer before execution."""
+        normalized_volume_ul = self._normalize_transfer_volume_ul(volume_ul)
+        plan_transfer_actions = getattr(self, "_plan_transfer_actions", None)
+        if planned_actions is None and plan_transfer_actions is not None:
+            planned_actions = plan_transfer_actions(normalized_volume_ul)
+        if planned_actions is None and plan_transfer_actions is None:
+            pipette = self.get_pipette(normalized_volume_ul)
+            pipette_label = pipette.get("name") or pipette.get("mount") or "unknown_pipette"
+            self.log_info(
+                f"Prepare action: {pipette_label} {source} {dest} {normalized_volume_ul} uL"
+            )
+            return
+
+        if not planned_actions:
+            self.log_info(f"Prepare action: no executable transfer actions for {source} {dest} {normalized_volume_ul} uL")
+            return
+
+        for index, action in enumerate(planned_actions, start=1):
+            pipette = action["pipette"]
+            pipette_label = pipette.get("name") or pipette.get("mount") or "unknown_pipette"
+            self.log_info(
+                f"Prepare action {index}/{len(planned_actions)}: "
+                f"{pipette_label} {source} {dest} {action['volume_ul']} uL"
+            )
 
     def _record_prepare_transfer(
         self,
@@ -977,7 +1077,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             "source_location": source,
             "dest_location": dest,
             "source_stock_name": source_stock_name,
-            "requested_volume_ul": float(requested_volume_ul),
+            "requested_volume_ul": self._normalize_transfer_volume_ul(requested_volume_ul),
             "transfer_params": dict(transfer_params or {}),
             "transfer_result": transfer_result,
         }
@@ -1014,32 +1114,36 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         extra : dict, optional
             Additional bookkeeping fields.
         """
-        if float(volume_ul) <= 0:
+        volume_ul = self._normalize_transfer_volume_ul(volume_ul)
+        if volume_ul <= 0:
             return
         stock_name = source_stock_name
         if stock_name is None:
             stock_name = self.config.get("deck", {}).get(source)
         selected_tip_location = None
+        planned_actions = self._plan_transfer_actions(volume_ul)
         if stock_name is not None:
             transfer_params, selected_tip_location = self._build_stock_transfer_params(
                 stock_name=stock_name,
                 volume_ul=volume_ul,
+                planned_actions=planned_actions,
             )
         else:
             transfer_params = self.get_transfer_params("default")
+        self._log_prepare_action(source, dest, volume_ul, planned_actions=planned_actions)
         transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
         self._activate_stock_tip_reservation(stock_name, selected_tip_location)
         depletion_info = {}
         if stock_name is not None:
             depletion_info = self._consume_stock_volume(
                 source,
-                sum(transfer_result.get("subtransfers_ul", [])) or float(volume_ul),
+                sum(transfer_result.get("subtransfers_ul", [])) or volume_ul,
             )
         self._record_prepare_transfer(
             stage_type=stage_type,
             source=source,
             dest=dest,
-            requested_volume_ul=float(volume_ul),
+            requested_volume_ul=volume_ul,
             source_stock_name=stock_name,
             transfer_params=transfer_params,
             transfer_result=transfer_result,
@@ -1154,7 +1258,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             elif stage_type == "final_mix":
                 for transfer in stage.get("transfers", []):
                     source_loc = self._resolve_stage_source(transfer.get("source_location"), intermediate_map)
-                    vol_ul = float(transfer.get("required_volume_ul", 0.0))
+                    vol_ul = self._normalize_transfer_volume_ul(transfer.get("required_volume_ul", 0.0))
                     if vol_ul <= 0:
                         continue
                     self._transfer_stage(
@@ -1218,7 +1322,9 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         """
         result_dict = balanced_target.to_dict()
         if hasattr(balanced_target, "volume") and balanced_target.volume is not None:
-            total_volume_ul = round(float(balanced_target.volume.to("ul").magnitude), 6)
+            total_volume_ul = self._normalize_transfer_volume_ul(
+                balanced_target.volume.to("ul").magnitude
+            )
             result_dict["total_volume"] = f"{total_volume_ul} ul"
         result_dict["stock_inventory_after"] = self._stock_inventory_snapshot()
         return result_dict
@@ -1365,7 +1471,9 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 stage_type="catch",
                 source=catch_params["source"],
                 dest=catch_params["dest"],
-                requested_volume_ul=float(catch_params.get("volume", 0.0)),
+                requested_volume_ul=self._normalize_transfer_volume_ul(
+                    catch_params.get("volume", 0.0)
+                ),
                 source_stock_name=self.config.get("deck", {}).get(catch_params["source"]),
                 transfer_params={k: v for k, v in catch_params.items() if k not in ("source", "dest", "volume")},
                 transfer_result=transfer_result,

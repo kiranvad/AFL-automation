@@ -113,6 +113,11 @@ class StopLoadCBv1(SensorCallbackThread):
                     time.sleep(time_to_sleep.total_seconds()) # was self.post_detection_sleep)
                     
                     print(f'waited for {time_to_sleep.total_seconds()} based on elapsed time of {elapsed_time.total_seconds()} and ratio of {self.post_detection_sleep*100} %')
+                    if self.app is not None:
+                        if not not_timed_out:
+                            self.app.logger.info('External load stopper timed out; requesting stopLoad().')
+                        else:
+                            self.app.logger.info('External load complete trigger fired; requesting stopLoad().')
                     self.load_client.server_cmd(cmd='stopLoad',secret='xrays>neutrons')
 
                     filename = self.filepath/str('Sensor-'+datestr+'.txt')
@@ -239,6 +244,11 @@ class StopLoadCBv2(SensorCallbackThread):
 
                         print(f'waited for {time_to_sleep.total_seconds()} based on elapsed time of {elapsed_time.total_seconds()} and ratio of {self.post_detection_sleep} %')
 
+                    if self.app is not None:
+                        if timed_out:
+                            self.app.logger.info('External load stopper timed out; requesting stopLoad().')
+                        else:
+                            self.app.logger.info('External load complete trigger fired; requesting stopLoad().')
                     self.loader_comm.stopLoad()
                     try:
                         filename = str(self.filepath/str('Sensor-'+datestr+'.txt'))
