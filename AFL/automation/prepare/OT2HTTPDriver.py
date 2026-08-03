@@ -546,10 +546,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             pipettes_data = response.json()['data']
             self.pipette_info = {}
-
-            # Update min/max transfer values based on attached pipettes
-            self.min_transfer = None
-            self.max_transfer = None
+            active_min_volumes = []
+            active_max_volumes = []
 
             for pipette in pipettes_data:
                 mount = pipette['mount']
@@ -579,23 +577,26 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 if pipette_id is None:
                     continue
                     
-                # Update global min/max transfer values
+                # Cache the global limits once.  Transfer planning used to call
+                # this method for every transfer, which repeatedly reset and
+                # re-logged these values even though the loaded pipettes had
+                # not changed.
                 min_volume = self.pipette_info[mount]['min_volume']
                 max_volume = self.pipette_info[mount]['max_volume']
+                if min_volume is not None:
+                    active_min_volumes.append(min_volume)
+                if max_volume is not None:
+                    active_max_volumes.append(max_volume)
 
-                if (self.min_transfer is None) or (self.min_transfer > min_volume):
-                        self.min_transfer = min_volume
-                        if self.app is not None:
-                            self.log_info(
-                                f"Setting minimum transfer to {self.min_transfer}"
-                            )
+            if self.min_transfer is None and active_min_volumes:
+                self.min_transfer = min(active_min_volumes)
+                if self.app is not None:
+                    self.log_info(f"Setting minimum transfer to {self.min_transfer}")
 
-                if (self.max_transfer is None) or (self.max_transfer < max_volume):
-                    self.max_transfer = max_volume
-                    if self.app is not None:
-                        self.log_info(
-                            f"Setting maximum transfer to {self.max_transfer}"
-                        )
+            if self.max_transfer is None and active_max_volumes:
+                self.max_transfer = max(active_max_volumes)
+                if self.app is not None:
+                    self.log_info(f"Setting maximum transfer to {self.max_transfer}")
             
             if self.app is not None:
                 self.log_debug(f"Pipette information updated: {self.pipette_info}")
@@ -1896,6 +1897,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             dest_position = "center"
 
         transfers = [step["volume_ul"] for step in transfer_plan]
+        self.log_info(
+            f"Total transfer plan: {source} -> {dest}, {volume_ul:g} uL"
+        )
         for transfer_index, step in enumerate(transfer_plan, start=1):
             planned_pipette = step["pipette"]
             sub_volume = step["volume_ul"]
@@ -2363,7 +2367,20 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def _available_pipette_options(self):
         """Return loaded pipettes with the volume limits needed for planning."""
-        self._update_pipettes()
+        # Pipette metadata is populated during initialization and whenever an
+        # instrument is loaded.  Do not fetch it again merely to plan a
+        # transfer: doing so needlessly refreshes the cached transfer limits.
+        # A newly loaded or replaced pipette invalidates that cache.
+        loaded_instruments = self.config.get("loaded_instruments", {})
+        cache_is_current = bool(self.pipette_info) and all(
+            mount in self.pipette_info
+            and self.pipette_info[mount].get("id") == instrument.get("pipette_id")
+            for mount, instrument in loaded_instruments.items()
+        )
+        if not cache_is_current:
+            self.min_transfer = None
+            self.max_transfer = None
+            self._update_pipettes()
         options = []
         for mount, pipette_data in self._get_active_pipettes().items():
             if not pipette_data or pipette_data.get("id") is None:

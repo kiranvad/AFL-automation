@@ -629,9 +629,23 @@ def test_split_transfer_logs_numbered_pipetting_plan(caplog):
         driver.transfer("1A1", "1A2", 350, drop_tip=True)
 
     assert [record.message for record in caplog.records] == [
+        "Total transfer plan: 1A1 -> 1A2, 350 uL",
         "Pipetting transfer plan 1/2: 1A1 -> 1A2 using p300_single (left), 300 uL",
         "Pipetting transfer plan 2/2: 1A1 -> 1A2 using p300_single (left), 50 uL",
     ]
+
+
+def test_transfer_planning_uses_cached_pipette_information():
+    driver = _configured_driver()
+
+    def unexpected_refresh():
+        raise AssertionError("transfer planning should use cached pipette information")
+
+    driver._update_pipettes = unexpected_refresh
+
+    options = driver._available_pipette_options()
+
+    assert [option["mount"] for option in options] == ["left"]
 
 
 @pytest.mark.parametrize(
