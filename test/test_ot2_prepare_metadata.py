@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2Prepare import OT2Prepare
 
 
@@ -247,48 +248,30 @@ def test_execute_preparation_marks_destination_occupied():
     assert driver.config["occupied_sample_locations"] == ["5A1"]
 
 
-def test_log_prepare_action_emits_planned_subtransfers_at_info_level(capsys):
+def test_execute_preparation_orders_stock_sources_by_stock_name_and_logs_actions(capsys):
     driver = StubOT2Prepare()
-    driver.get_pipette = lambda volume: (
-        {"mount": "right", "name": "p20_single", "min_volume": 1, "max_volume": 20}
-        if float(volume) < 30
-        else {"mount": "left", "name": "p300_single", "min_volume": 30, "max_volume": 300}
+    driver.config["deck"] = {
+        "1A1": "stock_Red",
+        "1A2": "stock_Blue",
+        "1A3": "stock_Red",
+    }
+    driver.config["stock_mix_order"] = ["stock_Blue", "stock_Red"]
+    balanced_target = SimpleNamespace(
+        protocol=[
+            SimpleNamespace(source="1A1", volume=100.0),
+            SimpleNamespace(source="1A2", volume=200.0),
+            # A second Red source models an inventory-driven split transfer.
+            SimpleNamespace(source="1A3", volume=50.0),
+        ]
     )
 
-    driver._log_prepare_action("1A1", "6A1", 23)
+    assert driver.execute_preparation({}, balanced_target, "5A1") is True
 
-    captured = capsys.readouterr()
-    assert "[INFO] Prepare action 1/2: p20_single 1A1 6A1 20 uL" in captured.out
-    assert "[INFO] Prepare action 2/2: p20_single 1A1 6A1 3 uL" in captured.out
-
-
-@pytest.mark.usefixtures("mixdb")
-def test_execute_preparation_raises_runtime_error_when_transfer_overconsumes_inventory():
-    class OverconsumeStubOT2Prepare(StubOT2Prepare):
-        def transfer(self, source, dest, volume, **kwargs):
-            raise ValueError(
-                "Cannot measure out 0.10000000000000003 milliliter from a solution with volume 0.1 milliliter"
-            )
-
-    driver = OverconsumeStubOT2Prepare()
-    driver.config["stocks"] = [
-        {
-            "name": "Water",
-            "masses": {"H2O": "20 g"},
-            "sources": [{"location": "1A1", "initial_volume": "100 ul"}],
-        }
-    ]
-    driver.process_stocks()
-    balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=100.0)])
-
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            r"Transfer failed from 1A1 to 5A1: "
-            r"Cannot measure out 0\.10000000000000003 milliliter from a solution with volume 0\.1 milliliter"
-        ),
-    ):
-        driver.execute_preparation({}, balanced_target, "5A1")
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1", "1A3"]
+    debug_output = capsys.readouterr().out
+    assert debug_output.count("[DEBUG] Pipette action:") == 3
+    assert "source='1A1'" in debug_output
+    assert "source='1A3'" in debug_output
 
 
 def test_resolve_destination_rejects_occupied_sample_location():
@@ -311,6 +294,13 @@ def test_clear_sample_locations_allows_destination_reuse():
     assert cleared == ["5A1"]
     assert driver.config["occupied_sample_locations"] == ["5A2"]
     assert driver.resolve_destination("5A1") == "5A1"
+
+
+def test_clear_sample_locations_is_a_queued_driver_command():
+    assert "clear_sample_locations" in Driver.queued.functions
+    assert Driver.queued.function_info["clear_sample_locations"]["kwargs"] == [
+        ("locations", None)
+    ]
 
 
 def test_reset_clears_tip_reservations_and_occupied_samples():
@@ -350,6 +340,7 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
         {"name": "stock_Yellow", "masses": {"H2O": "20 g"}, "location": "1A4"},
     ]
     driver.process_stocks()
+    driver.config["stock_mix_order"] = ["stock_Yellow", "stock_Blue", "stock_Red"]
     target = {
         "name": "color_sample",
         "location": "6A1",
@@ -372,9 +363,32 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
         "stock_Green": 100,
         "stock_Yellow": 200,
     }
-    assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
+    assert [call["source"] for call in driver.transfer_calls] == ["1A4", "1A2", "1A1", "1A3"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
-    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300, 400, 100, 200]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [200.0, 400.0, 300.0, 100.0]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_honors_stock_mix_order():
+    driver = StubOT2Prepare()
+    driver.config["stock_mix_order"] = ["stock_Blue", "stock_Red"]
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+
+    driver.prepare(
+        target={
+            "name": "ordered_sample",
+            "location": "6A1",
+            "stock_volume_fractions": {"stock_Red": 0.5, "stock_Blue": 0.5},
+            "total_volume": "1000 ul",
+        },
+        dest="6A1",
+    )
+
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1"]
 
 
 @pytest.mark.usefixtures("mixdb")

@@ -117,6 +117,9 @@ class APIServer:
         self.task_queue = MutableQueue()
         self.driver     = driver
         self.driver.app = self.app
+        # ``init_logging`` runs before a driver is available.  Apply the
+        # driver's persistent setting once the server and driver are paired.
+        self.driver._set_log_level(self.driver.config['log_level'])
         self.driver.data = self.data
         self.driver.configure_logger_level()
         self.init_logging()
@@ -374,47 +377,29 @@ class APIServer:
         path = pathlib.Path(resolved_afl_home).expanduser()
         path.mkdir(exist_ok=True,parents=True)
         filepath = path / f'{self.name}.log'
-        formatter = logging.Formatter(
-            '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+        filepath = filepath.resolve()
+
+        # ``init_logging`` is called during construction and is also called by
+        # legacy launchers.  Reuse the handler for this log file rather than
+        # attaching a second one, which would write every record twice.
+        file_handler = next(
+            (
+                handler for handler in self.app.logger.handlers
+                if isinstance(handler, FileHandler)
+                and pathlib.Path(handler.baseFilename).resolve() == filepath
+            ),
+            None,
         )
-
-        previous_handlers = getattr(self, '_afl_managed_log_handlers', [])
-        for logger_obj, handler in previous_handlers:
-            try:
-                logger_obj.removeHandler(handler)
-            except Exception:
-                pass
-            try:
-                handler.close()
-            except Exception:
-                pass
-
-        self.app.logger.handlers.clear()
-        self.app.logger.setLevel(resolved_level)
-        self.app.logger.propagate = False
-
-        stream_handler = logging.StreamHandler()
-        stream_handler.setLevel(resolved_level)
-        stream_handler.setFormatter(formatter)
-
-        file_handler = FileHandler(filepath)
-        file_handler.setLevel(resolved_level)
-        file_handler.setFormatter(formatter)
-
-        self.app.logger.addHandler(stream_handler)
-        self.app.logger.addHandler(file_handler)
+        if file_handler is None:
+            file_handler = FileHandler(filepath)
+            file_handler.setFormatter(logging.Formatter(
+                    '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+                    ))
+            self.app.logger.addHandler(file_handler)
 
         werkzeug_logger = logging.getLogger('werkzeug')
-        werkzeug_logger.setLevel(resolved_level)
-        werkzeug_logger.propagate = False
-        werkzeug_logger.handlers.clear()
-        werkzeug_logger.addHandler(file_handler)
-
-        self._afl_managed_log_handlers = [
-            (self.app.logger, stream_handler),
-            (self.app.logger, file_handler),
-            (werkzeug_logger, file_handler),
-        ]
+        if file_handler not in werkzeug_logger.handlers:
+            werkzeug_logger.addHandler(file_handler)
 
 
     def index(self):

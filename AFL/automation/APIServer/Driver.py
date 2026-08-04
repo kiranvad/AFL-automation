@@ -2,6 +2,7 @@ from AFL.automation.shared.PersistentConfig import PersistentConfig
 from AFL.automation.shared import serialization
 import logging
 import inspect
+import json
 import pathlib
 import uuid
 import os
@@ -57,7 +58,6 @@ class Driver(DriverWebAppsMixin):
         self.data = None
         self.dropbox = None
         self.logger = logging.getLogger(name if name is not None else 'Driver')
-        self.logger.propagate = False
         self._tiled_client = None  # Cached Tiled client
         self._combined_dataset_cache = {}
         self._combined_dataset_cache_order = []
@@ -81,18 +81,40 @@ class Driver(DriverWebAppsMixin):
         self.path.mkdir(exist_ok=True,parents=True)
         self.filepath = self.path / (name + '.config.json')
 
-        defaults = dict(self.gather_defaults() if defaults is None else defaults)
-        defaults.setdefault('log_level', 'INFO')
+        # The shared launcher sets this for a clean launch, allowing a driver
+        # to be constructed from its declared defaults without consuming a
+        # prior PersistentConfig history.
+        load_existing_config = os.environ.get('AFL_FRESH_DRIVER_CONFIG') != '1'
+
+        # Every driver can control the verbosity of the APIServer it is
+        # attached to.  Copy the supplied defaults so adding this common
+        # option does not mutate a driver's class-level ``defaults`` mapping.
+        config_defaults = dict(defaults) if defaults is not None else {}
+        config_defaults.setdefault('log_level', 'DEBUG')
 
         self.config = PersistentConfig(
             path=self.filepath,
-            defaults= defaults,
+            defaults=config_defaults,
             overrides= overrides,
+            load_existing=load_existing_config,
             )
-        self.configure_logger_level()
+        self._set_log_level(self.config['log_level'])
         
         # collect inherited static directories
         self.static_dirs = self.gather_static_dirs()
+
+    def _set_log_level(self, log_level):
+        """Set this driver's logger and its attached APIServer logger level."""
+        try:
+            self.logger.setLevel(log_level)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid log_level {log_level!r}; use a standard logging level "
+                "such as DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+            ) from exc
+
+        if self.app is not None and hasattr(self.app, 'logger'):
+            self.app.logger.setLevel(log_level)
 
     def _log(self, level, message):
         if self.app is not None and hasattr(self.app, 'logger'):
@@ -173,6 +195,10 @@ class Driver(DriverWebAppsMixin):
         return dirs
     
     def set_config(self,**kwargs):
+        if 'log_level' in kwargs:
+            # Validate before persisting, then update the active server without
+            # requiring a restart.
+            self._set_log_level(kwargs['log_level'])
         self.config.update(kwargs)
         if 'log_level' in kwargs:
             self.configure_logger_level()
@@ -477,3 +503,87 @@ class Driver(DriverWebAppsMixin):
             last_comment_as_header=last_comment_as_header,
             **kwargs,
         )
+
+
+class ProxyConnectionError(ConnectionError):
+    """Raised when a proxy driver cannot establish or use a remote Client."""
+
+
+class ProxyDriver(Driver):
+    """Base driver for forwarding commands to one or more AFL APIServers.
+
+    Subclasses retain their own API and safety policy, while this class owns
+    lazy ``Client`` construction and optional injected clients for testing.
+    A proxy connection is not opened during driver construction.
+    """
+
+    def __init__(self, name, defaults=None, overrides=None, proxy_clients=None):
+        super().__init__(name=name, defaults=defaults, overrides=overrides)
+        self._proxy_clients = dict(proxy_clients or {})
+
+    def get_proxy_client(self, proxy_name, *, ip, port, username=None, client_factory=None):
+        """Return a cached Client for ``proxy_name``, creating it on first use."""
+        if proxy_name not in self._proxy_clients:
+            if not ip:
+                raise ProxyConnectionError(
+                    f"Cannot connect {proxy_name} proxy: no APIServer address was configured"
+                )
+            if client_factory is None:
+                from AFL.automation.APIServer.Client import Client
+
+                client_factory = Client
+            address = f"{ip}:{port}"
+            try:
+                self._proxy_clients[proxy_name] = client_factory(
+                    ip=ip,
+                    port=str(port),
+                    username=username,
+                )
+            except Exception as exc:
+                raise ProxyConnectionError(
+                    f"Cannot connect {proxy_name} proxy to AFL APIServer at {address}. "
+                    "Check the server address, network reachability, and login settings."
+                ) from exc
+        return self._proxy_clients[proxy_name]
+
+    def _proxy_client(self, proxy_name):
+        try:
+            return self._proxy_clients[proxy_name]
+        except KeyError as exc:
+            raise ProxyConnectionError(
+                f"Cannot use {proxy_name} proxy because it has not been connected"
+            ) from exc
+
+    def enqueue_proxy(self, proxy_name, task_name, **kwargs):
+        """Enqueue a command on a named remote driver and return its task UUID."""
+        try:
+            return self._proxy_client(proxy_name).enqueue(
+                task_name=task_name,
+                interactive=False,
+                **kwargs,
+            )
+        except ProxyConnectionError:
+            raise
+        except Exception as exc:
+            raise ProxyConnectionError(
+                f"Unable to enqueue {task_name!r} through {proxy_name} proxy. "
+                "The remote AFL APIServer may be unavailable."
+            ) from exc
+
+    def query_proxy(self, proxy_name, command, **kwargs):
+        """Call a named unqueued operation on a remote driver."""
+        try:
+            result = self._proxy_client(proxy_name).query_driver(r=command, **kwargs)
+        except ProxyConnectionError:
+            raise
+        except Exception as exc:
+            raise ProxyConnectionError(
+                f"Unable to query {command!r} through {proxy_name} proxy. "
+                "The remote AFL APIServer may be unavailable."
+            ) from exc
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except json.JSONDecodeError:
+                pass
+        return result

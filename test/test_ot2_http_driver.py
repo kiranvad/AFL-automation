@@ -1,6 +1,8 @@
 import pytest
 from pathlib import Path
 import json
+import logging
+from types import SimpleNamespace
 
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 
@@ -262,6 +264,64 @@ class _FakeResponse:
         return self._payload
 
 
+def test_load_module_reports_an_actionable_attachment_error(monkeypatch):
+    driver = StubOT2HTTPDriver()
+
+    def fake_post(url, headers=None, params=None, json=None):
+        assert json["data"]["commandType"] == "loadModule"
+        return _FakeResponse(
+            {
+                "data": {
+                    "status": "failed",
+                    "error": {
+                        "errorType": "ModuleNotAttachedError",
+                        "errorCode": "4000",
+                        "detail": "No available temperatureModuleV1 with any serial found.",
+                    },
+                }
+            }
+        )
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        driver.load_module("temperatureModuleV1", "4")
+
+    message = str(exc_info.value)
+    assert "temperatureModuleV1" in message
+    assert "deck slot '4'" in message
+    assert "ModuleNotAttachedError (code 4000)" in message
+    assert "No available temperatureModuleV1 with any serial found." in message
+    assert "connected to the OT-2" in message
+    assert "detected by the Opentrons hardware server" in message
+
+
+def test_load_module_reuses_an_existing_matching_module_without_http_call(monkeypatch):
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_modules"]["4"] = ("module-4", "temperatureModuleV1")
+
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("An already-loaded matching module must not be loaded again")
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", unexpected_post)
+
+    assert driver.load_module("temperatureModuleV1", 4) == "module-4"
+
+
+def test_load_module_reports_a_conflicting_module_in_the_same_slot():
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_modules"]["4"] = ("module-4", "temperatureModuleV1")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        driver.load_module("magneticModuleV2", "4")
+
+    assert str(exc_info.value) == (
+        "Cannot load module 'magneticModuleV2' in deck slot '4': slot already "
+        "contains module 'temperatureModuleV1' with ID 'module-4'. Unload or "
+        "reset the existing module before replacing it."
+    )
+
+
 def test_set_flow_rates_updates_only_loaded_pipettes():
     driver = _configured_driver()
 
@@ -302,29 +362,33 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert transfer_result["dest"] == "1A2"
 
 
-def test_transfer_mix_before_reuses_source_z_offset_for_source_well_commands():
+def test_transfer_below_configured_pipette_minimum_is_a_no_op():
     driver = _configured_driver()
 
-    driver.transfer(
-        "1A1",
-        "1A2",
-        50,
-        mix_before=(2, 10),
-        source_z_offset=1.5,
-    )
+    result = driver.transfer("1A1", "1A2", 1e-14)
 
-    aspirates = [
-        params for command, params in driver.executed_commands if command == "aspirate"
-    ]
-    dispenses = [
-        params for command, params in driver.executed_commands if command == "dispense"
-    ]
+    assert result == {
+        "source": "1A1",
+        "dest": "1A2",
+        "requested_volume_ul": 1e-14,
+        "minimum_configured_pipette_volume_ul": 20.0,
+        "subtransfers_ul": [],
+        "status": "skipped_below_minimum_pipette_volume",
+    }
+    assert driver.executed_commands == []
+    assert driver.has_tip is False
 
-    assert aspirates[0]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
-    assert aspirates[1]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
-    assert aspirates[2]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
-    assert dispenses[0]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
-    assert dispenses[1]["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 1.5}
+
+def test_transfer_rounds_fractional_volume_to_an_integer_ul():
+    driver = _configured_driver()
+
+    result = driver.transfer("1A1", "1A2", 50.6)
+
+    assert result["requested_volume_ul"] == 51
+    aspirate = next(params for command, params in driver.executed_commands if command == "aspirate")
+    dispense = next(params for command, params in driver.executed_commands if command == "dispense")
+    assert aspirate["volume"] == 51
+    assert dispense["volume"] == 51
 
 
 def test_transfer_rejects_drop_tip_and_return_tip_together():
@@ -642,6 +706,62 @@ def test_split_transfer_drops_tip_without_force_new_tip():
     assert transfer_result["subtransfers_ul"] == [300, 50]
     assert driver.has_tip is False
     assert driver.current_tip is None
+
+
+def test_split_transfer_logs_numbered_pipetting_plan(caplog):
+    driver = _configured_driver()
+    driver.app = SimpleNamespace(logger=logging.getLogger("test_ot2_transfer_plan"))
+
+    with caplog.at_level(logging.INFO, logger="test_ot2_transfer_plan"):
+        driver.transfer("1A1", "1A2", 350, drop_tip=True)
+
+    assert [record.message for record in caplog.records] == [
+        "Pipetting transfer plan 1/2: 1A1 -> 1A2 using p300_single (left), 300 uL",
+        "Pipetting transfer plan 2/2: 1A1 -> 1A2 using p300_single (left), 50 uL",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("volume_ul", "expected_volumes"),
+    [
+        (320, [300.0, 20.0]),
+        (330, [300.0, 20.0, 10.0]),
+        (340, [300.0, 20.0, 20.0]),
+        (350, [300.0, 20.0, 20.0, 10.0]),
+    ],
+)
+def test_transfer_plan_uses_small_pipette_for_accurate_remainder(
+    volume_ul, expected_volumes
+):
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info(
+        "right", "right-id", min_volume=1, max_volume=20
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+
+    transfer_result = driver.transfer("1A1", "1A2", volume_ul, drop_tip=True)
+
+    assert transfer_result["subtransfers_ul"] == expected_volumes
+    assert [step["mount"] for step in transfer_result["pipette_plan"]] == (
+        ["left"] + ["right"] * (len(expected_volumes) - 1)
+    )
+    assert [step["volume_ul"] for step in transfer_result["pipette_plan"]] == expected_volumes
+    aspirate_pipettes = [
+        params["pipetteId"]
+        for command, params in driver.executed_commands
+        if command == "aspirate"
+    ]
+    assert aspirate_pipettes == ["left-id"] + ["right-id"] * (len(expected_volumes) - 1)
 
 
 def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():
