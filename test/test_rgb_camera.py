@@ -1,6 +1,7 @@
 import numpy as np
 from types import SimpleNamespace
 
+from AFL.automation.shared.samplecells import NeutronSampleCell
 from AFL.automation.vision.RGBCamera import RGBCamera
 
 
@@ -111,11 +112,9 @@ def test_background_subtraction_handles_an_unchanged_frame():
 def test_capture_processed_frame_reopens_camera_for_each_acquisition():
     driver = object.__new__(RGBCamera)
     driver.config = {
-        "px_crop": [0, 1],
-        "py_crop": [0, 1],
-        "hough_radii": 1,
         "camera_warmup_delay": 0,
     }
+    driver.sample_cell = NeutronSampleCell()
     resets = []
     frames = ["first", "second"]
     driver._reset_camera = lambda: resets.append("reset")

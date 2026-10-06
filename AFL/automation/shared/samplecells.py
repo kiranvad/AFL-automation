@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -9,13 +10,141 @@ import numpy as np
 from AFL.automation.vision.ImageProcessing import ImageProcessing
 
 
-class NeutronSampleCell(ImageProcessing):
+class SampleCell(ImageProcessing):
+    """Base interface for sample-cell image geometry.
+
+    Sample-cell configuration deliberately lives on the cell instead of on a
+    camera or instrument driver.  Subclasses should implement
+    :meth:`extract_sample_image`; they may reuse the image-processing helpers
+    inherited from :class:`ImageProcessing`.
+    """
+
+    defaults = {}
+
+    def __init__(self, overrides=None, **config):
+        self.config = {}
+        for parent in reversed(type(self).__mro__):
+            self.config.update(copy.deepcopy(getattr(parent, "defaults", {})))
+        if overrides is not None:
+            self.config.update(copy.deepcopy(overrides))
+        self.config.update(copy.deepcopy(config))
+
+    def extract_sample_image(self, image, **kwargs):
+        """Return the image and mask for the sample region."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _display_image(image, color_order):
+        image = np.asarray(image)
+        if image.ndim == 3 and str(color_order).upper() == "BGR":
+            return image[..., ::-1]
+        return image
+
+    def save_geometry_plot(
+        self,
+        raw_image,
+        sample_image,
+        *,
+        save_path,
+        filename,
+        title="Detected sample-cell region",
+        color_order="RGB",
+        overlay_mask=None,
+        show_full_image_axes=True,
+        full_image_x_label="px",
+        full_image_y_label="py",
+    ):
+        """Save a reusable full-frame and extracted-region diagnostic plot.
+
+        A crop rectangle and circular outline are drawn when the corresponding
+        metadata is present, so subclasses with non-circular geometry can use
+        this routine without supplying neutron-cell-specific fields.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle, Rectangle
+
+        raw_image = np.asarray(raw_image)
+        row_crop = sample_image.get("row_crop", [0, raw_image.shape[0]])
+        col_crop = sample_image.get("col_crop", [0, raw_image.shape[1]])
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        axes[0].imshow(self._display_image(raw_image, color_order))
+        axes[0].add_patch(
+            Rectangle(
+                (col_crop[0], row_crop[0]),
+                col_crop[1] - col_crop[0],
+                row_crop[1] - row_crop[0],
+                edgecolor="red",
+                facecolor="none",
+                linewidth=2,
+            )
+        )
+        axes[0].set_title("Captured image with cell crop")
+        if show_full_image_axes:
+            axes[0].set_xlabel(full_image_x_label)
+            axes[0].set_ylabel(full_image_y_label)
+        else:
+            axes[0].axis("off")
+
+        axes[1].imshow(self._display_image(sample_image["cropped_img"], color_order))
+        if overlay_mask is not None:
+            axes[1].imshow(np.where(overlay_mask, 1.0, np.nan), alpha=0.35, cmap="magma")
+        if all(key in sample_image for key in ("cx", "cy", "radius")):
+            axes[1].add_patch(
+                Circle(
+                    (sample_image["cx"], sample_image["cy"]),
+                    sample_image["radius"],
+                    edgecolor="red",
+                    facecolor="none",
+                    linewidth=2,
+                )
+            )
+        axes[1].set_title(title)
+        axes[1].axis("off")
+        fig.tight_layout()
+
+        output_path = Path(save_path) / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
+
+    def save_mask_comparison_plot(
+        self,
+        reference_image,
+        measurement_image,
+        mask,
+        *,
+        save_path,
+        filename,
+        title,
+        invert_mask=False,
+    ):
+        """Save a reference/measurement mask diagnostic plot."""
+        import matplotlib.pyplot as plt
+
+        mask = ~np.asarray(mask, dtype=bool) if invert_mask else np.asarray(mask, dtype=bool)
+        fig, axes = plt.subplots(1, 2)
+        for axis, image, label in zip(
+            axes, (reference_image, measurement_image), ("Reference", "Measurement")
+        ):
+            axis.imshow(image)
+            axis.imshow(np.where(mask, 0.0, np.nan))
+            axis.set_title(label)
+            axis.axis("off")
+        fig.suptitle(title)
+        output_path = Path(save_path) / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path)
+        plt.close(fig)
+        return output_path
+
+
+class NeutronSampleCell(SampleCell):
     """Describe the circular optical region of a neutron sample cell.
 
-    This is deliberately not a :class:`Driver`.  Instrument drivers inherit
-    it alongside ``Driver`` to share the cell's crop, circular ROI, and
-    geometry plots while retaining their own camera acquisition and
-    measurement logic.
+    This is deliberately not a :class:`Driver`. Instrument drivers hold a
+    sample-cell instance so its crop, circular ROI, and geometry configuration
+    remain independent of camera acquisition and measurement settings.
     """
 
     geometry_defaults = {
@@ -23,6 +152,7 @@ class NeutronSampleCell(ImageProcessing):
         "col_crop": [0, 479],
         "hough_radii": 98,
     }
+    defaults = geometry_defaults
 
     def extract_sample_image(
         self,
@@ -57,106 +187,3 @@ class NeutronSampleCell(ImageProcessing):
             "row_crop": list(row_crop) if row_crop is not None else [0, image.shape[0]],
             "col_crop": list(col_crop) if col_crop is not None else [0, image.shape[1]],
         }
-
-    @staticmethod
-    def _display_image(image, color_order):
-        image = np.asarray(image)
-        if image.ndim == 3 and str(color_order).upper() == "BGR":
-            return image[..., ::-1]
-        return image
-
-    def save_geometry_plot(
-        self,
-        raw_image,
-        sample_image,
-        *,
-        save_path,
-        filename,
-        title="Detected neutron sample-cell region",
-        color_order="RGB",
-        overlay_mask=None,
-        show_full_image_axes=True,
-        full_image_x_label="px",
-        full_image_y_label="py",
-    ):
-        """Save a raw-frame crop and circular-ROI diagnostic plot.
-
-        When ``show_full_image_axes`` is true, retain the full-frame pixel
-        coordinate ticks and label its x/y axes with the supplied labels.
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Circle, Rectangle
-
-        raw_image = np.asarray(raw_image)
-        row_crop = sample_image["row_crop"]
-        col_crop = sample_image["col_crop"]
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        axes[0].imshow(self._display_image(raw_image, color_order))
-        axes[0].add_patch(
-            Rectangle(
-                (col_crop[0], row_crop[0]),
-                col_crop[1] - col_crop[0],
-                row_crop[1] - row_crop[0],
-                edgecolor="red",
-                facecolor="none",
-                linewidth=2,
-            )
-        )
-        axes[0].set_title("Captured image with cell crop")
-        if show_full_image_axes:
-            axes[0].set_xlabel(full_image_x_label)
-            axes[0].set_ylabel(full_image_y_label)
-        else:
-            axes[0].axis("off")
-
-        axes[1].imshow(self._display_image(sample_image["cropped_img"], color_order))
-        if overlay_mask is not None:
-            axes[1].imshow(np.where(overlay_mask, 1.0, np.nan), alpha=0.35, cmap="magma")
-        axes[1].add_patch(
-            Circle(
-                (sample_image["cx"], sample_image["cy"]),
-                sample_image["radius"],
-                edgecolor="red",
-                facecolor="none",
-                linewidth=2,
-            )
-        )
-        axes[1].set_title(title)
-        axes[1].axis("off")
-        fig.tight_layout()
-
-        output_path = Path(save_path) / filename
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_path, dpi=100, bbox_inches="tight")
-        plt.close(fig)
-        return output_path
-
-    def save_mask_comparison_plot(
-        self,
-        reference_image,
-        measurement_image,
-        mask,
-        *,
-        save_path,
-        filename,
-        title,
-        invert_mask=False,
-    ):
-        """Save a shared reference/measurement mask diagnostic plot."""
-        import matplotlib.pyplot as plt
-
-        mask = ~np.asarray(mask, dtype=bool) if invert_mask else np.asarray(mask, dtype=bool)
-        fig, axes = plt.subplots(1, 2)
-        for axis, image, label in zip(
-            axes, (reference_image, measurement_image), ("Reference", "Measurement")
-        ):
-            axis.imshow(image)
-            axis.imshow(np.where(mask, 0.0, np.nan))
-            axis.set_title(label)
-            axis.axis("off")
-        fig.suptitle(title)
-        output_path = Path(save_path) / filename
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_path)
-        plt.close(fig)
-        return output_path

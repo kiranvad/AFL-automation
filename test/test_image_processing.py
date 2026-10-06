@@ -3,7 +3,7 @@ import pytest
 import matplotlib.pyplot as plt
 
 from AFL.automation.APIServer.Driver import Driver
-from AFL.automation.shared.samplecells import NeutronSampleCell
+from AFL.automation.shared.samplecells import NeutronSampleCell, SampleCell
 from AFL.automation.vision.ImageProcessing import ImageProcessing
 from AFL.automation.vision.PiCameraDriver import PiCameraDriver
 from AFL.automation.vision.RGBCamera import RGBCamera, _DEFAULT_CUSTOM_CONFIG
@@ -106,21 +106,23 @@ def test_picamera_measurements_apply_rectangular_crop_only_when_both_bounds_give
 
 
 def test_rgb_camera_uses_image_processing_mixin_and_vision_loader(monkeypatch):
-    driver = RGBCamera(overrides={
-        "background_capture_on_init": False,
-        "px_crop": [1, 5],
-        "py_crop": [1, 5],
-    })
+    sample_cell = NeutronSampleCell(
+        row_crop=[1, 5], col_crop=[1, 5], hough_radii=2
+    )
+    driver = RGBCamera(
+        overrides={"background_capture_on_init": False}, sample_cell=sample_cell
+    )
     image = np.zeros((6, 6, 3), dtype=np.uint8)
     image[..., 0] = 30  # B
     image[..., 1] = 20  # G
     image[..., 2] = 10  # R
 
-    monkeypatch.setattr(driver, "find_circular_region", lambda image, radii: (3, 3, 2))
+    monkeypatch.setattr(sample_cell, "find_circular_region", lambda image, radii: (3, 3, 2))
     processed = driver._process_image(image, px_crop=[1, 5], py_crop=[1, 5], hough_radii=2)
     configured_crop = driver._process_image(image, hough_radii=2)
 
-    assert isinstance(driver, (NeutronSampleCell, ImageProcessing, Driver))
+    assert isinstance(driver, Driver)
+    assert isinstance(driver.sample_cell, (NeutronSampleCell, ImageProcessing))
     assert processed["avg_rgb"] == {"R": 10.0, "G": 20.0, "B": 30.0}
     assert processed["mask"].shape == (4, 4)
     assert configured_crop["mask"].shape == (4, 4)
@@ -128,8 +130,8 @@ def test_rgb_camera_uses_image_processing_mixin_and_vision_loader(monkeypatch):
     assert "set_background" in driver.queued.functions
     assert RGBCamera.__module__ == "AFL.automation.vision.RGBCamera"
     assert _DEFAULT_CUSTOM_CONFIG["_classname"] == "AFL.automation.vision.RGBCamera.RGBCamera"
-    assert "px_crop" in driver.config
-    assert "py_crop" in driver.config
+    assert "px_crop" not in driver.config
+    assert "py_crop" not in driver.config
     assert "row_crop" not in driver.config
     assert "col_crop" not in driver.config
     assert "row_crop" not in _DEFAULT_CUSTOM_CONFIG["overrides"]
@@ -195,6 +197,33 @@ def test_neutron_sample_cell_extracts_shared_crop_and_circle(monkeypatch):
     assert sample["col_crop"] == [1, 5]
 
 
+def test_camera_accepts_sample_cell_subclasses_and_rejects_other_objects():
+    class CustomSampleCell(SampleCell):
+        def extract_sample_image(self, image, **kwargs):
+            image = np.asarray(image)
+            return {
+                "cropped_img": image,
+                "mask": np.ones(image.shape[:2], dtype=bool),
+                "cx": 0,
+                "cy": 0,
+                "radius": 1,
+                "row_crop": [0, image.shape[0]],
+                "col_crop": [0, image.shape[1]],
+            }
+
+    cell = CustomSampleCell(label="custom")
+    driver = RGBCamera(
+        overrides={"background_capture_on_init": False}, sample_cell=cell
+    )
+
+    assert driver.sample_cell is cell
+    assert cell.config == {"label": "custom"}
+    assert cell.save_geometry_plot.__func__ is SampleCell.save_geometry_plot
+    assert cell.save_mask_comparison_plot.__func__ is SampleCell.save_mask_comparison_plot
+    with pytest.raises(TypeError, match="SampleCell"):
+        RGBCamera(overrides={"background_capture_on_init": False}, sample_cell=object())
+
+
 def test_rgb_geometry_plot_keeps_full_image_pixel_axes(monkeypatch, tmp_path):
     driver = RGBCamera(overrides={"background_capture_on_init": False})
     captured = {}
@@ -216,7 +245,7 @@ def test_rgb_geometry_plot_keeps_full_image_pixel_axes(monkeypatch, tmp_path):
         "col_crop": [2, 4],
     }
 
-    driver.save_geometry_plot(
+    driver.sample_cell.save_geometry_plot(
         np.zeros((5, 5, 3), dtype=np.uint8),
         sample,
         save_path=tmp_path,

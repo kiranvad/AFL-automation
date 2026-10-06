@@ -9,10 +9,10 @@ import numpy as np
 import xarray as xr
 
 from AFL.automation.APIServer.Driver import Driver
-from AFL.automation.shared.samplecells import NeutronSampleCell
+from AFL.automation.shared.samplecells import NeutronSampleCell, SampleCell
 
 
-class RGBCamera(NeutronSampleCell, Driver):
+class RGBCamera(Driver):
     """
     Driver for capturing RGB images and computing average RGB values.
     
@@ -23,9 +23,6 @@ class RGBCamera(NeutronSampleCell, Driver):
     defaults = {
         "camera_index": 0,
         "save_path": "/home/afl642/rgb_images/",
-        "px_crop": [220, 350],
-        "py_crop": [120, 250],
-        "hough_radii": 40,
         "subtract_background": True,
         "show_background_pipeline": False,
         "background_threshold": 25,
@@ -34,7 +31,7 @@ class RGBCamera(NeutronSampleCell, Driver):
         "camera_warmup_delay": 0.2,
     }
 
-    def __init__(self, overrides=None):
+    def __init__(self, overrides=None, sample_cell=None):
         """
         Initialize RGBCamera driver.
 
@@ -42,7 +39,17 @@ class RGBCamera(NeutronSampleCell, Driver):
         ----------
         overrides : dict, optional
             Configuration overrides for PersistentConfig.
+        sample_cell : SampleCell, optional
+            Geometry and image-processing strategy. Defaults to a neutron
+            sample cell configured for the legacy RGB-camera crop.
         """
+        if sample_cell is None:
+            sample_cell = NeutronSampleCell(
+                row_crop=[120, 250], col_crop=[220, 350], hough_radii=40
+            )
+        if not isinstance(sample_cell, SampleCell):
+            raise TypeError("sample_cell must be an instance of SampleCell")
+        self.sample_cell = sample_cell
         self._opencv_capture = None
         # ``bkg`` is deliberately a locator, never an image array.  A
         # background captured without Tiled is stored under AFL_HOME; after a
@@ -223,15 +230,9 @@ class RGBCamera(NeutronSampleCell, Driver):
             `(img, processed)` where `img` is the raw BGR frame and `processed`
             is the payload returned by `_process_image`.
         """
-        px_crop = self.config["px_crop"]
-        py_crop = self.config["py_crop"]
-        hough_radii = self.config["hough_radii"]
         warmup_delay = self.config.get("camera_warmup_delay", 0.2)
 
-        self.log_info(
-            "Capturing RGB image with circular ROI detection "
-            f"(px_crop={px_crop}, py_crop={py_crop}, hough_radii={hough_radii})."
-        )
+        self.log_info(f"Capturing RGB image using {type(self.sample_cell).__name__} geometry.")
         self.log_debug("Attempting to collect camera image.")
 
         # A number of still-image camera backends acquire only when the
@@ -291,10 +292,10 @@ class RGBCamera(NeutronSampleCell, Driver):
             Input image in BGR format (from OpenCV).
         px_crop : list, optional
             Pixel range [start, end] for cropping along the x-axis. Defaults to
-            the driver's ``px_crop`` configuration.
+            the sample cell's configured column crop.
         py_crop : list, optional
             Pixel range [start, end] for cropping along the y-axis. Defaults to
-            the driver's ``py_crop`` configuration.
+            the sample cell's configured row crop.
         hough_radii : int or list, optional
             Radius or radii to use for Hough circle detection.
 
@@ -304,16 +305,15 @@ class RGBCamera(NeutronSampleCell, Driver):
             Processed image payload including cropped image, mask, center, radius,
             and average RGB values computed inside the mask.
         """
-        px_crop = self.config["px_crop"] if px_crop is None else px_crop
-        py_crop = self.config["py_crop"] if py_crop is None else py_crop
-        sample = self.extract_sample_image(
-            img,
-            row_crop=py_crop,
-            col_crop=px_crop,
-            hough_radii=hough_radii,
-            color_order="BGR",
-        )
-        sample["avg_rgb"] = self.rgb_values(
+        cell_overrides = {"color_order": "BGR"}
+        if px_crop is not None:
+            cell_overrides["col_crop"] = px_crop
+        if py_crop is not None:
+            cell_overrides["row_crop"] = py_crop
+        if hough_radii is not None:
+            cell_overrides["hough_radii"] = hough_radii
+        sample = self.sample_cell.extract_sample_image(img, **cell_overrides)
+        sample["avg_rgb"] = self.sample_cell.rgb_values(
             sample["cropped_img"], sample["mask"], color_order="BGR"
         )
         return sample
@@ -395,7 +395,7 @@ class RGBCamera(NeutronSampleCell, Driver):
         # zero-valued foreground measurement instead of passing an empty mask
         # to rgb_values(), which would abort the queued capture.
         if changed_pixel_count:
-            avg_rgb = self.rgb_values(extracted, mask, color_order="BGR")
+            avg_rgb = self.sample_cell.rgb_values(extracted, mask, color_order="BGR")
         else:
             avg_rgb = {"R": 0.0, "G": 0.0, "B": 0.0}
 
@@ -636,12 +636,12 @@ class RGBCamera(NeutronSampleCell, Driver):
         if plotting:
             try:
                 save_path = pathlib.Path(self.config.get("save_path", "./"))
-                plot_file = self.save_geometry_plot(
+                plot_file = self.sample_cell.save_geometry_plot(
                     img,
                     processed,
                     save_path=save_path,
                     filename=f"{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}-rgb-capture.png",
-                    title="Detected neutron sample cell",
+                    title=f"Detected {type(self.sample_cell).__name__}",
                     color_order="BGR",
                     show_full_image_axes=True,
                     full_image_x_label="px",
@@ -658,11 +658,16 @@ class RGBCamera(NeutronSampleCell, Driver):
 
 _DEFAULT_CUSTOM_CONFIG = {
     "_classname": "AFL.automation.vision.RGBCamera.RGBCamera",
+    "sample_cell": {
+        "_classname": "AFL.automation.shared.samplecells.NeutronSampleCell",
+        "overrides": {
+            "row_crop": [120, 250],
+            "col_crop": [220, 350],
+            "hough_radii": 40,
+        },
+    },
     "overrides": {
         "camera_index": 0,
-        "px_crop": [220, 350],
-        "py_crop": [120, 250],
-        "hough_radii": 40,
         "save_path": "/home/afl642/rgb_camera/",
         "subtract_background": True,
         "show_background_pipeline": False,
