@@ -88,11 +88,25 @@ class SampleCell(ImageProcessing):
         axes[1].imshow(self._display_image(sample_image["cropped_img"], color_order))
         if overlay_mask is not None:
             axes[1].imshow(np.where(overlay_mask, 1.0, np.nan), alpha=0.35, cmap="magma")
-        if all(key in sample_image for key in ("cx", "cy", "radius")):
+        if sample_image.get("geometry", "circular") == "circular" and all(
+            key in sample_image for key in ("cx", "cy", "radius")
+        ):
             axes[1].add_patch(
                 Circle(
                     (sample_image["cx"], sample_image["cy"]),
                     sample_image["radius"],
+                    edgecolor="red",
+                    facecolor="none",
+                    linewidth=2,
+                )
+            )
+        if "body_bbox" in sample_image:
+            left, top, right, bottom = sample_image["body_bbox"]
+            axes[1].add_patch(
+                Rectangle(
+                    (left, top),
+                    right - left,
+                    bottom - top,
                     edgecolor="red",
                     facecolor="none",
                     linewidth=2,
@@ -184,6 +198,77 @@ class NeutronSampleCell(SampleCell):
             "cx": cx,
             "cy": cy,
             "radius": radius,
+            "row_crop": list(row_crop) if row_crop is not None else [0, image.shape[0]],
+            "col_crop": list(col_crop) if col_crop is not None else [0, image.shape[1]],
+        }
+
+
+class ScrewCapVial(SampleCell):
+    """Describe the rectangular body of an upright cylindrical screw-cap vial.
+
+    The configured row and column bounds first isolate the complete vial.  A
+    band at the top of that crop is then excluded from the sample mask so the
+    screw cap does not contribute to image measurements.  ``cap_height`` may
+    be supplied in pixels for a calibrated camera; otherwise
+    ``cap_height_fraction`` is used relative to the cropped image height.
+    """
+
+    geometry_defaults = {
+        "row_crop": [0, 479],
+        "col_crop": [0, 479],
+        "cap_height": None,
+        "cap_height_fraction": 0.2,
+    }
+    defaults = geometry_defaults
+
+    def extract_sample_image(
+        self,
+        image,
+        *,
+        row_crop=None,
+        col_crop=None,
+        cap_height=None,
+        cap_height_fraction=None,
+        color_order="RGB",
+    ):
+        """Crop ``image`` to the vial and mask out its screw cap."""
+        image = np.asarray(image)
+        config = getattr(self, "config", {})
+        row_crop = row_crop if row_crop is not None else config.get("row_crop")
+        col_crop = col_crop if col_crop is not None else config.get("col_crop")
+        if cap_height is None:
+            cap_height = config.get("cap_height")
+        if cap_height_fraction is None:
+            cap_height_fraction = config.get("cap_height_fraction", 0.2)
+
+        cropped_image = self.crop_image(image, row_crop=row_crop, col_crop=col_crop)
+        height, width = cropped_image.shape[:2]
+
+        if cap_height is None:
+            cap_height_fraction = float(cap_height_fraction)
+            if not 0 <= cap_height_fraction < 1:
+                raise ValueError("cap_height_fraction must satisfy 0 <= value < 1")
+            cap_height = int(np.ceil(height * cap_height_fraction))
+        else:
+            cap_height = int(cap_height)
+            if not 0 <= cap_height < height:
+                raise ValueError(
+                    f"cap_height must satisfy 0 <= cap_height < cropped height ({height})"
+                )
+
+        mask = np.zeros((height, width), dtype=bool)
+        mask[cap_height:, :] = True
+        body_height = height - cap_height
+        return {
+            "cropped_img": cropped_image,
+            "gray_img": self.to_grayscale(cropped_image, color_order=color_order),
+            "mask": mask,
+            "geometry": "cylindrical_vial",
+            "body_bbox": [0, cap_height, width, height],
+            "cap_height": cap_height,
+            "cx": width // 2,
+            "cy": cap_height + body_height // 2,
+            "radius": width // 2,
             "row_crop": list(row_crop) if row_crop is not None else [0, image.shape[0]],
             "col_crop": list(col_crop) if col_crop is not None else [0, image.shape[1]],
         }
