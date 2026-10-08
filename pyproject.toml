@@ -77,6 +77,7 @@ picamera = ["picamera2"]
 serial = ["pyserial"]
 seabreeze = ["seabreeze"]
 opentrons = ["opentrons"]
+ufactory = ["xarm-python-sdk>=1.18,<2", "opentrons==9.1.2", "PyYAML>=6,<7"]
 pyspec = ["certif-pyspec"]
 scattering-processing = ["fabio", "pyFAI"]
 sas-analysis = ["sasmodels", "sasdata"]
@@ -107,6 +108,7 @@ packages = ["AFL"]
 packages = ["AFL"]
 include = [
   "AFL/**/*.py",
+  "AFL/**/*.yaml",
   "support/labware/*.json",
 ]
 
@@ -114,6 +116,7 @@ include = [
 packages = ["AFL"]
 include = [
   "AFL/**/*.py",
+  "AFL/**/*.yaml",
   "support/labware/*.json",
 ]
 
