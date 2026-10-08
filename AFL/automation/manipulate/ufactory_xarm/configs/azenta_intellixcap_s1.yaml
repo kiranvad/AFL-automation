@@ -1,0 +1,19 @@
+name: AzentaIntelliXCapS1
+rail_position: 100
+# Seven joint angles in degrees. Cartesian travel from bottom to engage retains
+# the orientation reached at the bottom joint pose.
+poses:
+  horizontal:
+    base: [-0.81211, 5.236204, 7.956951, 16.148242, 2.959728, -57.830292, 0.0]
+    bottom: [-0.457679, 30.062007, -1.304281, 50.539289, -13.301674, -49.451873, 5.599058]
+locations:
+  bottom:
+    xyz: [669.442139, 40.899723, 172.416412]
+    entries:
+      horizontal: bottom
+    route: bottom
+  engage:
+    xyz: [684.529663, 39.79409, 214.88739]
+    entries:
+      horizontal: bottom
+    route: bottom
