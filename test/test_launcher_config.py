@@ -91,6 +91,53 @@ from AFL.automation.shared import launcher
     assert json.loads(published_path.read_text()) == {"port": 5096, "enabled": False}
 
 
+def test_launcher_accepts_an_explicit_server_port(tmp_path):
+    afl_home = tmp_path / ".afl"
+    observed_port = tmp_path / "observed-port.txt"
+    launcher_script = tmp_path / "LauncherPortDriver.py"
+    launcher_script.write_text(
+        """
+from AFL.automation.APIServer.APIServer import APIServer
+from AFL.automation.APIServer.Driver import Driver
+import os
+
+
+class LauncherPortDriver(Driver):
+    defaults = {}
+
+    def __init__(self, overrides=None):
+        super().__init__("LauncherPortDriver", self.gather_defaults(), overrides)
+
+
+def capture_port(self, **kwargs):
+    with open(os.environ["OBSERVED_PORT"], "w") as output:
+        output.write(str(kwargs["port"]))
+
+
+APIServer.run = capture_port
+APIServer.init_logging = lambda self, **kwargs: None
+from AFL.automation.shared import launcher
+""".strip()
+        + "\n"
+    )
+    environment = os.environ | {
+        "AFL_HOME": str(afl_home),
+        "HOME": str(tmp_path),
+        "OBSERVED_PORT": str(observed_port),
+        "PYTHONPATH": str(Path(__file__).parents[1]),
+    }
+
+    subprocess.run(
+        [sys.executable, str(launcher_script), "--port", "5095"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert observed_port.read_text() == "5095"
+
+
 def test_launcher_falls_back_to_default_data_when_tiled_is_unreachable(tmp_path):
     afl_home = tmp_path / ".afl"
     launcher_script = tmp_path / "LauncherTiledFallbackDriver.py"

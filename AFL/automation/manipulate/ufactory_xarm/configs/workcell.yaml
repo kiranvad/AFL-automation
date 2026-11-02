@@ -1,0 +1,27 @@
+# Robot-wide settings. Station coordinates use link_base at their rail stop.
+# All distances are in mm; linear speeds are in mm/s.
+
+arm:
+  # null leaves the speed to the SDK/controller.
+  speed_mm_s: null
+  joint_speed_deg_s: null
+
+gripper:
+  # Calibrated full jaw span: 86 mm corresponds to SDK position 688; zero is closed.
+  span_mm: 84.40
+  span_sdk: 840
+  # SDK gripper speed in r/min; null keeps the SDK/controller setting.
+  speed: null
+  # Total extra opening beyond the labware grasp width, capped at fully open.
+  open_clearance_mm: 8.0
+
+tool:
+  # New fingertips place the grasp point 10 mm farther along tool Z.
+  tcp_offset_mm: [0.0, 0.0, 0.0]
+
+rail:
+  # Physical travel limits for the installed AL1300 linear rail.
+  min_position_mm: 0.0
+  max_position_mm: 700.0
+  robot_position: 0.0
+  speed_mm_s: 100
