@@ -11,5 +11,6 @@ How-to guides are problem-oriented instructions that help users accomplish speci
    live-plotting
    my-first-server
    static-directories
+   tiled-http-proxy
    run-tests
    
