@@ -1,4 +1,4 @@
-pi-plates
-spidev
-rpi-lgpio
+pi-plates; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')
+spidev; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')
+rpi-lgpio; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')
 labjack-ljm

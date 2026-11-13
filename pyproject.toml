@@ -73,7 +73,13 @@ roboctl = "AFL.automation.cli:main"
 labjack = ["labjack-ljm"]
 piplates = ["pi-plates"]
 # Hardware used by PneumaticPressureSampleCell's default configuration.
-loader = ["pi-plates", "spidev", "rpi-lgpio", "labjack-ljm"]
+# Install Pi-only packages on Linux ARM hosts; LabJack also supports workstations.
+loader = [
+  "pi-plates; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')",
+  "spidev; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')",
+  "rpi-lgpio; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv8l' or platform_machine == 'armv7l' or platform_machine == 'armv6l')",
+  "labjack-ljm",
+]
 rpi-gpio = ["RPi.GPIO"]
 picamera = ["picamera2"]
 serial = ["pyserial"]

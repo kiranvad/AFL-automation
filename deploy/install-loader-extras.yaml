@@ -1,6 +1,16 @@
 - name: Print facts
   hosts: afl.pis
   tasks:
+   - name: Install build tools for loader Python extensions (including lgpio)
+     become: true
+     ansible.builtin.apt:
+       name:
+         - build-essential
+         - python3-dev
+         - swig
+       state: present
+       update_cache: yes
+       cache_valid_time: 3600
    - name: create LabJackM dir
      ansible.builtin.file:
        path: /home/pi/LabJackM
